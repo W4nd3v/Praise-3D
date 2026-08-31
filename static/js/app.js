@@ -1,0 +1,1 @@
+document.addEventListener('DOMContentLoaded',()=>{if(window.lucide)lucide.createIcons();document.querySelectorAll('[data-modal]').forEach(b=>b.addEventListener('click',()=>document.getElementById(b.dataset.modal).showModal()));document.querySelectorAll('dialog .close').forEach(b=>b.addEventListener('click',()=>b.closest('dialog').close()));});
