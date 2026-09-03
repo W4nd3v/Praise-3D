@@ -11,30 +11,82 @@ function fillNamedForm(form, values) {
   });
   syncSearchable(form);
 }
+function uiIcon(name) {
+  const svg=document.createElementNS('http://www.w3.org/2000/svg','svg'),use=document.createElementNS('http://www.w3.org/2000/svg','use');
+  svg.setAttribute('class','icon');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');
+  svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','1.75');svg.setAttribute('stroke-linecap','round');svg.setAttribute('stroke-linejoin','round');svg.setAttribute('aria-hidden','true');
+  use.setAttribute('href','/static/icons/lucide.svg#'+name);svg.append(use);return svg;
+}
+function showToast(message, type='error') {
+  let host=document.querySelector('.messages');
+  if(!host){host=document.createElement('div');host.className='messages';host.setAttribute('aria-live','polite');document.body.append(host)}
+  const box=document.createElement('div'),text=document.createElement('span'),close=document.createElement('button');
+  box.className='message '+type;text.textContent=message;close.type='button';close.setAttribute('aria-label','Fechar');
+  close.append(uiIcon('x'));box.append(uiIcon(type==='success'?'circle-check':'info'),text,close);host.append(box);initMessages(host);
+}
+function askConfirmation(message) {
+  const dialog=document.getElementById('confirm-dialog');
+  if(dialog.open)return Promise.resolve(false);
+  document.getElementById('confirm-description').textContent=message;
+  dialog.returnValue='';
+  return new Promise(resolve=>{
+    const accept=()=>dialog.close('confirmed'),cancel=()=>dialog.close('cancelled');
+    const yes=dialog.querySelector('[data-confirm-accept]'),no=dialog.querySelector('[data-confirm-cancel]');
+    yes.addEventListener('click',accept);no.addEventListener('click',cancel);
+    dialog.addEventListener('close',()=>{yes.removeEventListener('click',accept);no.removeEventListener('click',cancel);resolve(dialog.returnValue==='confirmed')},{once:true});
+    dialog.showModal();no.focus();
+  });
+}
+function enhanceAutocomplete(input, getOptions) {
+  if(input.dataset.comboboxBound)return;
+  input.dataset.comboboxBound='1';
+  const wrap=document.createElement('div'),list=document.createElement('ul'),id=input.id || 'lookup-'+crypto.randomUUID();
+  input.id=id;wrap.className='combobox';list.className='combobox-list';list.id=id+'-list';list.hidden=true;list.setAttribute('role','listbox');
+  input.before(wrap);wrap.append(input,uiIcon('chevron-down'),list);
+  input.removeAttribute('list');input.setAttribute('role','combobox');input.setAttribute('aria-autocomplete','list');input.setAttribute('aria-expanded','false');input.setAttribute('aria-controls',list.id);input.autocomplete='off';
+  if(!input.getAttribute('aria-label'))input.setAttribute('aria-label',input.closest('label')?.childNodes[0]?.textContent.trim() || input.placeholder || 'Pesquisar');
+  let options=[],active=-1;
+  const normalize=value=>value.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase('pt-BR');
+  function close(){list.hidden=true;input.setAttribute('aria-expanded','false');input.removeAttribute('aria-activedescendant');active=-1}
+  function highlight(index){active=index;[...list.children].forEach((li,i)=>li.setAttribute('aria-selected',String(i===index)));const selected=list.children[index];if(selected){input.setAttribute('aria-activedescendant',selected.id);selected.scrollIntoView({block:'nearest'})}}
+  function choose(index){const option=options[index];if(!option)return;input.value=option.text;input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));close();input.focus()}
+  function render(showAll=false){
+    options=getOptions().filter(o=>!o.disabled && (showAll || normalize(o.text).includes(normalize(input.value)))).slice(0,80);list.replaceChildren();active=-1;
+    options.forEach((option,index)=>{const li=document.createElement('li');li.textContent=option.text;li.id=list.id+'-'+index;li.setAttribute('role','option');li.setAttribute('aria-selected','false');li.addEventListener('mousedown',event=>{event.preventDefault();choose(index)});list.append(li)});
+    if(!options.length){const li=document.createElement('li');li.className='no-results';li.textContent='Nenhum resultado. Confira o nome informado.';list.append(li)}
+    list.hidden=false;input.setAttribute('aria-expanded','true');
+  }
+  input.addEventListener('input',()=>render());
+  input.addEventListener('focus',()=>render(true));
+  input.addEventListener('click',()=>{if(list.hidden)render(true)});
+  input.addEventListener('blur',()=>close());
+  input.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&!list.hidden){event.preventDefault();event.stopPropagation();close()}
+    if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();if(list.hidden)render(true);if(options.length)highlight((active+(event.key==='ArrowDown'?1:-1)+options.length)%options.length)}
+    if(event.key==='Enter'&&!list.hidden&&active>=0){event.preventDefault();choose(active)}
+  });
+}
 function syncSearchable(root = document) {
-  root?.querySelectorAll('select[data-search-input]').forEach(select => {
-    const input = document.getElementById(select.dataset.searchInput);
-    const list = document.getElementById(input.getAttribute('list'));
-    list.replaceChildren(...[...select.options].filter(o=>o.value).map(o=>{const entry=document.createElement('option');entry.value=o.text;return entry}));
-    input.value = select.value ? select.selectedOptions[0]?.text || '' : '';
-    input.setCustomValidity('');
+  root?.querySelectorAll('select[data-search-input]').forEach(select=>{
+    const input=document.getElementById(select.dataset.searchInput);
+    if(input){input.value=select.value?select.selectedOptions[0]?.text||'':'';input.setCustomValidity('')}
   });
 }
 function initSearchable(root = document) {
-  root.querySelectorAll('#request-customer, #product-dialog select[name="category"], #product-dialog select[name="product_type"], select[data-searchable]').forEach(select => {
-    if (select.dataset.searchInput) return;
-    const id = `search-${crypto.randomUUID()}`;
-    const input = document.createElement('input'), list = document.createElement('datalist');
-    input.id=id; list.id=`${id}-options`; input.setAttribute('list',list.id);
-    input.placeholder='Digite para pesquisar e selecione'; input.autocomplete='off'; input.required=select.required;
-    select.required=false; select.hidden=true; select.dataset.searchInput=id;
-    select.after(input,list);
+  root.querySelectorAll('#request-customer, #product-dialog select[name="category"], #product-dialog select[name="product_type"], select[data-searchable]').forEach(select=>{
+    if(select.dataset.searchInput)return;
+    const input=document.createElement('input');input.id='search-'+crypto.randomUUID();input.placeholder='Pesquisar e selecionar';input.required=select.required;
+    select.required=false;select.hidden=true;select.dataset.searchInput=input.id;select.after(input);
     input.addEventListener('input',()=>{
-      const option=[...select.options].find(o=>o.value && o.text===input.value);
-      select.value=option?.value || '';
-      input.setCustomValidity(input.value && !option ? 'Selecione uma opção cadastrada na lista.' : '');
+      const option=[...select.options].find(o=>o.value&&o.text===input.value);
+      select.value=option?.value||'';input.setCustomValidity(input.value&&!option?'Selecione uma opção cadastrada na lista.':'');
       select.dispatchEvent(new Event('change',{bubbles:true}));
     });
+    enhanceAutocomplete(input,()=>[...select.options].filter(o=>o.value).map(o=>({text:o.text,disabled:o.disabled})));
+  });
+  root.querySelectorAll('input[list]').forEach(input=>{
+    const list=document.getElementById(input.getAttribute('list'));
+    if(list)enhanceAutocomplete(input,()=>[...list.options].map(o=>({text:o.value,disabled:o.disabled})));
   });
   syncSearchable(root);
 }
@@ -79,6 +131,7 @@ async function saveQuote() {
       if(!response.ok) throw new Error(data.error || 'Não foi possível salvar.');
       form.querySelector('.form-error').hidden=true;
       document.querySelector('[data-commercial-status]').textContent='Orçamento salvo';
+      showToast('Orçamento salvo com sucesso.','success');
       return true;
     } catch(error) {showFormError(form,error.message);return false}
     finally {quoteSavePromise=null}
@@ -106,9 +159,11 @@ function initUi(root = document) {
   root.querySelectorAll('[data-dialog]').forEach(button=>bindOnce(button,'dialogBound','click',()=>{
     const dialog=document.getElementById(button.dataset.dialog);
     if(['product-dialog','filament-dialog','supply-dialog','store-dialog','customer-dialog','printer-dialog','family-dialog','payment-dialog','category-dialog','type-dialog'].includes(button.dataset.dialog) && !button.matches('[class*="edit-"],[class*="add-"],[class*="adjust-"]')) {
-      dialog?.querySelector('form')?.reset();
+      if(dialog?.dataset.editorMode==='edit')dialog.querySelector('form')?.reset();
+      if(dialog)dialog.dataset.editorMode='create';
       if(button.dataset.dialog==='product-dialog')dialog.querySelector('[data-product-title]').textContent='Novo produto';
     }
+    if(button.matches('[class*="edit-"]') && dialog)dialog.dataset.editorMode='edit';
     syncSearchable(dialog); dialog?.showModal();
   }));
   root.querySelectorAll('[data-close-dialog]').forEach(button=>bindOnce(button,'closeBound','click',()=>button.closest('dialog')?.close()));
@@ -118,7 +173,11 @@ function initUi(root = document) {
     group?.querySelectorAll('[data-panel]').forEach(item=>item.hidden=true);
     button.classList.add('active'); const panel=group?.querySelector(`[data-panel="${button.dataset.tab}"]`);if(panel)panel.hidden=false;
   }));
-  root.querySelectorAll('[data-confirm]').forEach(form=>bindOnce(form,'confirmBound','submit',event=>{if(!window.confirm(form.dataset.confirm))event.preventDefault()}));
+  root.querySelectorAll('[data-confirm]').forEach(form=>bindOnce(form,'confirmBound','submit',async event=>{
+    if(form.dataset.confirmApproved){delete form.dataset.confirmApproved;return}
+    event.preventDefault();const submitter=event.submitter;
+    if(await askConfirmation(form.dataset.confirm)){form.dataset.confirmApproved='1';if(submitter)form.requestSubmit(submitter);else form.requestSubmit()}
+  }));
   root.querySelectorAll('.clickable-row[data-href]').forEach(row=>bindOnce(row,'rowBound','click',event=>{if(!event.target.closest('a,button,input,select,form'))window.location.href=row.dataset.href}));
   const reminder=root.querySelector('[name=reminder_enabled]'), reminderFields=root.querySelector('[data-reminder-fields]');
   if(reminder && reminderFields)bindOnce(reminder,'reminderBound','change',()=>reminderFields.hidden=!reminder.checked);
@@ -132,7 +191,7 @@ function initUi(root = document) {
     } catch(error){showFormError(form,error.message)} finally {delete form.dataset.busy}
   }));
   root.querySelectorAll('[data-open-composition]').forEach(button=>bindOnce(button,'composerBound','click',async()=>{
-    button.disabled=true;
+    button.disabled=true;button.classList.add('is-loading');
     try {
       const url=button.dataset.openComposition,response=await fetch(url),parsed=new DOMParser().parseFromString(await response.text(),'text/html');
       const editor=parsed.getElementById('composition-editor');if(!editor)throw new Error('Não foi possível abrir os itens.');
@@ -140,7 +199,7 @@ function initUi(root = document) {
       initCompositionEditors(editor,url);initUi(editor);document.getElementById('quote-composition-dialog').showModal();
       if(button.hasAttribute('data-add-item'))document.getElementById('item-dialog').showModal();
       if(button.dataset.itemId)editor.querySelector(`.edit-item[data-id="${button.dataset.itemId}"]`)?.click();
-    } catch(error){alert(error.message)} finally {button.disabled=false}
+    } catch(error){showToast(error.message)} finally {button.disabled=false;button.classList.remove('is-loading')}
   }));
   root.querySelectorAll('.edit-store').forEach(button=>bindOnce(button,'storeEditBound','click',()=>{
     fillNamedForm(document.querySelector('#store-dialog form'),{store_id:button.dataset.id,name:button.dataset.name,contact_name:button.dataset.contact,phone:button.dataset.phone,address:button.dataset.address,commission:button.dataset.commission,notes:button.dataset.notes});
@@ -193,8 +252,8 @@ function initUi(root = document) {
   root.querySelectorAll('[data-convert-quote]').forEach(form=>bindOnce(form,'saveConvert','submit',async event=>{event.preventDefault();if(await saveQuote())HTMLFormElement.prototype.submit.call(form)}));
   root.querySelectorAll('form').forEach(form=>bindOnce(form,'doubleSubmit','submit',event=>{
     if(event.defaultPrevented)return;
-    if(form.dataset.submitting){event.preventDefault();return}form.dataset.submitting='1';
-    setTimeout(()=>form.querySelectorAll('button[type=submit],button:not([type])').forEach(button=>button.disabled=true),0);
+    if(form.dataset.submitting){event.preventDefault();return}
+    queueMicrotask(()=>{if(event.defaultPrevented)return;form.dataset.submitting='1';form.setAttribute('aria-busy','true');form.querySelectorAll('button[type=submit],button:not([type])').forEach(button=>button.disabled=true)});
   }));
 }
 function initCompositionEditors(root = document, actionUrl=null) {
@@ -212,7 +271,44 @@ function initMessages(root=document) {
 }
 document.addEventListener('DOMContentLoaded',()=>{
   initCompositionEditors(document);initUi(document);initMessages(document);updateQuotePreview();
-  document.querySelector('[data-toggle-sidebar]')?.addEventListener('click',()=>document.querySelector('.sidebar')?.classList.toggle('open'));
+  const menu=document.querySelector('[data-toggle-sidebar]'),sidebar=document.querySelector('.sidebar'),backdrop=document.querySelector('[data-close-sidebar]');
+  function setMenu(open){sidebar?.classList.toggle('open',open);document.body.classList.toggle('sidebar-open',open);menu?.setAttribute('aria-expanded',String(open));if(backdrop)backdrop.hidden=!open;if(sidebar)sidebar.inert=matchMedia('(max-width:760px)').matches&&!open;if(open)sidebar?.querySelector('a')?.focus();else menu?.focus()}
+  menu?.addEventListener('click',()=>setMenu(!sidebar.classList.contains('open')));
+  backdrop?.addEventListener('click',()=>setMenu(false));
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&sidebar?.classList.contains('open'))setMenu(false)});
+  const mobileMedia=matchMedia('(max-width:760px)');
+  if(sidebar)sidebar.inert=mobileMedia.matches;
+  mobileMedia.addEventListener('change',()=>{if(sidebar?.classList.contains('open'))setMenu(false);if(sidebar)sidebar.inert=mobileMedia.matches});
+  document.addEventListener('keydown',event=>{
+    if(event.key!=='Tab'||!sidebar?.classList.contains('open'))return;
+    const links=[...sidebar.querySelectorAll('a,button')],first=links[0],last=links.at(-1);
+    if(event.shiftKey&&document.activeElement===first){event.preventDefault();menu.focus()}
+    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();menu.focus()}
+    else if(document.activeElement===menu){event.preventDefault();(event.shiftKey?last:first)?.focus()}
+  });
+  document.querySelectorAll('dialog').forEach(dialog=>{
+    if(!dialog.hasAttribute('aria-labelledby')){const title=dialog.querySelector('.dialog-head h2');if(title){title.id=title.id||dialog.id+'-title';dialog.setAttribute('aria-labelledby',title.id)}}
+  });
+  document.querySelectorAll('.side-nav a.active').forEach(link=>link.setAttribute('aria-current','page'));
+  document.querySelectorAll('.switch-line input').forEach(input=>{
+    input.setAttribute('role','switch');
+    if(input.closest('.compact')){const row=input.closest('tr'),index=[...row.children].indexOf(input.closest('td')),header=input.closest('table').querySelectorAll('th')[index];input.setAttribute('aria-label',(row.children[0]?.textContent.trim()||'Componente')+' · '+(header?.textContent.trim()||'Ativar'))}
+  });
+  const settingsTabs=[...document.querySelectorAll('[data-settings-tab]')];
+  function showSettings(key){if(!settingsTabs.some(b=>b.dataset.settingsTab===key))key='company';settingsTabs.forEach(button=>{const active=button.dataset.settingsTab===key;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active))});document.querySelectorAll('[data-settings-section]').forEach(section=>section.hidden=section.dataset.settingsSection!==key);try{sessionStorage.setItem('praise-settings-section',key)}catch{}}
+  if(settingsTabs.length){let active='company';try{active=sessionStorage.getItem('praise-settings-section')||active}catch{}showSettings(active);settingsTabs.forEach(button=>button.addEventListener('click',()=>showSettings(button.dataset.settingsTab)));document.getElementById('company-form')?.addEventListener('invalid',event=>{const section=event.target.closest('[data-settings-section]');if(section)showSettings(section.dataset.settingsSection)},true)}
+  document.querySelectorAll('[data-tabs]').forEach((group,index)=>{
+    group.querySelector('.tabs')?.setAttribute('role','tablist');
+    const buttons=[...group.querySelectorAll('[data-tab]')];
+    buttons.forEach((button,number)=>{
+      const panel=group.querySelector('[data-panel="'+button.dataset.tab+'"]');if(!panel)return;
+      button.id=button.id||'tab-'+index+'-'+number;panel.id=panel.id||'panel-'+index+'-'+number;
+      button.setAttribute('role','tab');button.setAttribute('aria-controls',panel.id);panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',button.id);
+      const refresh=()=>buttons.forEach(b=>{const on=b.classList.contains('active');b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1});
+      refresh();button.addEventListener('click',refresh);
+      button.addEventListener('keydown',event=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const target=event.key==='Home'?0:event.key==='End'?buttons.length-1:(number+(event.key==='ArrowRight'?1:-1)+buttons.length)%buttons.length;buttons[target].click();buttons[target].focus()}});
+    });
+  });
   const params=new URLSearchParams(location.search);
   document.querySelectorAll('form[data-filters] [name]').forEach(field=>{if(params.has(field.name))field.value=params.get(field.name)});
   document.querySelectorAll('[data-tabs][data-initial-tab]').forEach(group=>[...group.querySelectorAll('[data-tab]')].find(b=>b.dataset.tab===group.dataset.initialTab)?.click());

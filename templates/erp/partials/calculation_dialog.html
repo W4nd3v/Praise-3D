@@ -1,5 +1,6 @@
+{% load ui %}
 <dialog id="{% if calculation %}calculation-{{ dialog_id }}{% else %}{{ dialog_id }}{% endif %}"><form method="post">{% csrf_token %}<input type="hidden" name="action" value="calculation">{% if calculation %}<input type="hidden" name="calculation_id" value="{{ calculation.pk }}">{% endif %}
-<div class="dialog-head"><h2>{% if calculation %}Editar {{ calculation.name }}{% else %}Novo modelo de cálculo{% endif %}</h2><button type="button" data-close-dialog>×</button></div>
+<div class="dialog-head"><h2>{% if calculation %}Editar {{ calculation.name }}{% else %}Novo modelo de cálculo{% endif %}</h2><button type="button" data-close-dialog aria-label="Fechar">{% icon "x" %}</button></div>
 <div class="dialog-body"><div class="form-grid">
 <label class="span-5 required">Nome<input name="name" value="{{ calculation.name|default:'' }}" required></label>
 <label class="span-7">Descrição<input name="description" value="{{ calculation.description|default:'' }}"></label>

@@ -26,11 +26,13 @@ def qty(value):
 @register.filter
 def status_class(value):
     value = str(value or "").lower()
+    if value == "art":
+        return "art"
     if value in {"paid", "received", "ready", "completed", "converted", "approved", "ok"}:
         return "success"
     if value in {"cancelled", "expired", "critical", "blocked"}:
         return "danger"
-    if value in {"warning", "pending", "waiting", "partial"}:
+    if value in {"warning", "pending", "waiting", "partial", "material"}:
         return "warning"
     return "info"
 
@@ -39,3 +41,8 @@ def status_class(value):
 def get_item(mapping, key):
     return mapping.get(str(key), mapping.get(key, "")) if mapping else ""
 
+
+@register.filter
+def stock_label(value):
+    """Translate display keys without changing stock thresholds or quantities."""
+    return {"ok": "Disponível", "warning": "Atenção", "critical": "Crítico"}.get(str(value), value)
