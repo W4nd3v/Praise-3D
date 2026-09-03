@@ -1,4 +1,6 @@
-Django==5.2.17
+Django==6.0.8
 PyMySQL==1.2.0
+python-dotenv==1.2.3
 Pillow==12.3.0
 reportlab==5.0.1
+

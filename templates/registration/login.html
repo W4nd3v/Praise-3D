@@ -1,1 +1,18 @@
-{% load static %}<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Entrar · Praise3D</title><link rel="stylesheet" href="{% static 'css/app.css' %}"></head><body class="login"><form method="post" class="loginbox">{% csrf_token %}<div class="brand loginbrand"><span class="brandmark">P</span><span><b>Praise3D</b><small>A PIONEIRA DO 3D</small></span></div><h1>Bem-vindo</h1><p>Acesse a central de gestão da sua empresa.</p>{{ form.as_p }}<button class="btn primary" type="submit">Entrar</button>{% if form.errors %}<div class="error">Usuário ou senha inválidos.</div>{% endif %}</form></body></html>
+{% load static %}
+<!doctype html>
+<html lang="pt-br">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar | Praise 3D</title><link rel="stylesheet" href="{% static 'css/app.css' %}"></head>
+<body class="login-body">
+<main class="login-card">
+    <div class="login-brand"><span class="brand-mark">P</span><div><strong>Praise 3D</strong><small>A pioneira do 3D</small></div></div>
+    <h1>Bem-vindo de volta</h1><p>Acesse o centro de operação da sua empresa.</p>
+    {% if form.errors %}<div class="message error">Usuário ou senha inválidos.</div>{% endif %}
+    <form method="post" class="stack-form">{% csrf_token %}
+        <label>Usuário<input type="text" name="username" autofocus autocomplete="username" required></label>
+        <label>Senha<input type="password" name="password" autocomplete="current-password" required></label>
+        <button class="button primary wide" type="submit">Entrar no sistema</button>
+    </form>
+    <small class="muted">Gestão integrada para empresas de impressão 3D.</small>
+</main>
+</body></html>
+

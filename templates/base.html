@@ -1,7 +1,66 @@
-{% load static %}<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{% block title %}Praise3D{% endblock %}</title><link rel="stylesheet" href="{% static 'css/app.css' %}"><script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.js" defer></script><script src="{% static 'js/app.js' %}" defer></script></head>
-<body style="--primary:{{ request.company.primary_color|default:'#146EF5' }};--secondary:{{ request.company.secondary_color|default:'#FFB31A' }}">
-<header><a class="brand" href="/"><span class="brandmark">P</span><span><b>{{ request.company.trading_name|default:'Praise3D' }}</b><small>{{ request.company.slogan|default:'A PIONEIRA DO 3D' }}</small></span></a><nav class="quick"><a class="accent" href="/requests/"><i data-lucide="plus"></i> Solicitação de orçamento</a><a href="/quotes/"><i data-lucide="plus"></i> Orçamentos</a><a href="/orders/"><i data-lucide="plus"></i> Pedidos</a><a href="/production/"><i data-lucide="plus"></i> Produção</a><a href="/catalog/"><i data-lucide="plus"></i> Registrar venda</a><button data-modal="open-roll"><i data-lucide="plus"></i> Abrir rolo</button><button data-modal="finish-roll"><i data-lucide="plus"></i> Finalizar rolo</button></nav><div class="profile"><i data-lucide="bell"></i><span>{{ request.user.first_name|default:request.user.username }}</span></div></header>
-<aside><nav>{% for key,label,icon in sidebar %}{% endfor %}<a class="{% if active == 'home' %}active{% endif %}" href="/"><i data-lucide="home"></i>Início</a><a class="{% if active == 'requests' %}active{% endif %}" href="/requests/"><i data-lucide="clipboard-list"></i>Solicitações</a><a class="{% if active == 'quotes' %}active{% endif %}" href="/quotes/"><i data-lucide="file-text"></i>Orçamentos</a><a class="{% if active == 'orders' %}active{% endif %}" href="/orders/"><i data-lucide="briefcase"></i>Pedidos</a><a class="{% if active == 'production' %}active{% endif %}" href="/production/"><i data-lucide="printer"></i>Produção</a><a class="{% if active == 'catalog' %}active{% endif %}" href="/catalog/"><i data-lucide="box"></i>Catálogo</a><a class="{% if active == 'stock' %}active{% endif %}" href="/stock/"><i data-lucide="package"></i>Estoque</a><a class="{% if active == 'materials' %}active{% endif %}" href="/materials/"><i data-lucide="wrench"></i>Materiais</a><a class="{% if active == 'customers' %}active{% endif %}" href="/customers/"><i data-lucide="users"></i>Clientes</a><a class="{% if active == 'consignment' %}active{% endif %}" href="/consignment/"><i data-lucide="circle-dollar-sign"></i>Consignação</a><a class="{% if active == 'finance' %}active{% endif %}" href="/finance/"><i data-lucide="wallet"></i>Financeiro</a><a class="{% if active == 'reports' %}active{% endif %}" href="/reports/"><i data-lucide="chart-no-axes-combined"></i>Relatórios</a><a class="{% if active == 'settings' %}active{% endif %}" href="/settings/"><i data-lucide="settings"></i>Parâmetros</a></nav><div class="help"><i data-lucide="headphones"></i><span><b>Precisa de ajuda?</b><small>Fale conosco</small></span></div></aside>
-<main>{% if messages %}{% for message in messages %}<div class="notice">{{ message }}</div>{% endfor %}{% endif %}{% block content %}{% endblock %}</main>
-<dialog id="open-roll"><button class="close">×</button><h2>Abrir rolo</h2><p>Selecione um filamento fechado na tela Materiais.</p><a class="btn primary" href="/materials/">Ir para Materiais</a></dialog><dialog id="finish-roll"><button class="close">×</button><h2>Finalizar rolo</h2><p>Selecione o filamento em uso na tela Materiais.</p><a class="btn primary" href="/materials/">Ir para Materiais</a></dialog>
-</body></html>
+{% load static erp_tags %}
+<!doctype html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="{{ current_company.primary_color|default:'#1769e8' }}">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect rx='15' width='64' height='64' fill='%231769e8'/%3E%3Cpath d='M18 12h17c12 0 18 6 18 16S46 44 34 44h-6v9H18zm10 9v14h6c6 0 9-2 9-7s-3-7-9-7z' fill='white'/%3E%3Cpath d='M45 10h10v10z' fill='%23ffb21c'/%3E%3C/svg%3E">
+    <title>{{ title|default:'Praise 3D' }} | {{ current_company|default:'Praise 3D' }}</title>
+    <link rel="stylesheet" href="{% static 'css/app.css' %}">
+    <style>:root{--primary:{{ current_company.primary_color|default:'#1769e8' }};--secondary:{{ current_company.secondary_color|default:'#ffb21c' }};--success:{{ current_company.success_color|default:'#16a263' }};--danger:{{ current_company.warning_color|default:'#e64545' }};}</style>
+</head>
+<body>
+<div class="app-shell">
+    <header class="topbar">
+        <a class="brand" href="{% url 'dashboard' %}">
+            {% if current_company.logo %}<img src="{{ current_company.logo.url }}" alt="{{ current_company }}">{% else %}<span class="brand-mark">P</span>{% endif %}
+            <span><strong>{{ current_company.trading_name|default:current_company.name|default:'Praise 3D' }}</strong><small>{{ current_company.slogan|default:'A pioneira do 3D' }}</small></span>
+        </a>
+        <nav class="quick-actions" aria-label="Ações rápidas">
+            <a class="quick primary" href="{% url 'requests' %}"><b>＋</b> Solicitação de orçamento</a>
+            <a class="quick" href="{% url 'quotes' %}"><b>＋</b> Orçamentos</a>
+            <a class="quick" href="{% url 'orders' %}"><b>＋</b> Pedidos</a>
+            <a class="quick" href="{% url 'production' %}"><b>＋</b> Produção</a>
+            <a class="quick" href="{% url 'pos' %}"><b>＋</b> Registrar venda</a>
+            <a class="quick" href="{% url 'materials' %}#filamentos"><b>＋</b> Abrir rolo</a>
+            <a class="quick" href="{% url 'materials' %}#filamentos"><b>＋</b> Finalizar rolo</a>
+        </nav>
+        <div class="userbox">
+            <span class="notification" title="Alertas">♧{% if nav_badges.alerts %}<i>{{ nav_badges.alerts }}</i>{% endif %}</span>
+            <span class="avatar">{{ request.user.first_name|default:request.user.username|slice:':2'|upper }}</span>
+            <span class="user-name">{{ request.user.first_name|default:request.user.username }}</span>
+            <form action="{% url 'logout' %}" method="post">{% csrf_token %}<button class="icon-button" title="Sair">⌄</button></form>
+        </div>
+    </header>
+
+    <aside class="sidebar" id="sidebar">
+        <nav class="side-nav">
+            <a href="{% url 'dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}"><span>⌂</span>Início</a>
+            <a href="{% url 'requests' %}" class="{% if 'request' in request.resolver_match.url_name %}active{% endif %}"><span>▧</span>Solicitações{% if nav_badges.requests %}<em>{{ nav_badges.requests }}</em>{% endif %}</a>
+            <a href="{% url 'quotes' %}" class="{% if 'quote' in request.resolver_match.url_name %}active{% endif %}"><span>▤</span>Orçamentos</a>
+            <a href="{% url 'orders' %}" class="{% if 'order' in request.resolver_match.url_name %}active{% endif %}"><span>▱</span>Pedidos</a>
+            <a href="{% url 'production' %}" class="{% if 'production' in request.resolver_match.url_name %}active{% endif %}"><span>▦</span>Produção{% if nav_badges.production %}<em>{{ nav_badges.production }}</em>{% endif %}</a>
+            <a href="{% url 'catalog' %}" class="{% if request.resolver_match.url_name == 'catalog' %}active{% endif %}"><span>◇</span>Catálogo</a>
+            <a href="{% url 'stock' %}" class="{% if 'stock' in request.resolver_match.url_name or 'replenish' in request.resolver_match.url_name %}active{% endif %}"><span>⬡</span>Estoque</a>
+            <a href="{% url 'materials' %}" class="{% if 'material' in request.resolver_match.url_name %}active{% endif %}"><span>⌁</span>Materiais</a>
+            <a href="{% url 'customers' %}" class="{% if 'customer' in request.resolver_match.url_name %}active{% endif %}"><span>♧</span>Clientes</a>
+            <a href="{% url 'consignment' %}" class="{% if 'consignment' in request.resolver_match.url_name or 'shipment' in request.resolver_match.url_name or 'settlement' in request.resolver_match.url_name %}active{% endif %}"><span>◉</span>Consignação</a>
+            <a href="{% url 'finance' %}" class="{% if 'finance' in request.resolver_match.url_name %}active{% endif %}"><span>＄</span>Financeiro</a>
+            <a href="{% url 'reports' %}" class="{% if 'report' in request.resolver_match.url_name %}active{% endif %}"><span>▥</span>Relatórios</a>
+            <a href="{% url 'settings' %}" class="{% if request.resolver_match.url_name == 'settings' %}active{% endif %}"><span>⚙</span>Parâmetros</a>
+        </nav>
+        <div class="help-card"><span>♧</span><div><strong>Precisa de ajuda?</strong><small>Fale conosco</small></div></div>
+    </aside>
+
+    <main class="main-content">
+        <button class="mobile-menu" type="button" data-toggle-sidebar>☰</button>
+        {% if messages %}<div class="messages">{% for message in messages %}<div class="message {{ message.tags }}"><span>{{ message }}</span><button type="button" aria-label="Fechar">×</button></div>{% endfor %}</div>{% endif %}
+        {% block content %}{% endblock %}
+        <footer>© {% now 'Y' %} {{ current_company|default:'Praise 3D' }} · Todos os direitos reservados. <span>Versão 1.0.0</span></footer>
+    </main>
+</div>
+<script src="{% static 'js/app.js' %}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
