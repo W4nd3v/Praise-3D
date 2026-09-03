@@ -67,6 +67,21 @@ python manage.py test
 
 ## Atualização de correções — setembro/2026
 
+### Correção 3 — operação, Cliente 360 e lembretes
+
+- Início: pendências clicáveis e próximas ações calculadas. Produção inclui arte, material, fila e impressão; prontos ficam separados.
+- Pedido: prioridade Normal/Prioritário/Urgente, resumo de todas as produções, cronologia, links diretos e entrega somente após todas as demandas ficarem prontas.
+- Novos pedidos calculados geram uma demanda por item da composição. Demandas antigas são preservadas; antes de iniciarem a impressão, recalcular permite separar os itens sem perder o código inicial. Consumo/reserva é limitado ao item da demanda. Alterações na composição exigem retornar todas as demandas a arte/material.
+- Cliente 360: visão geral, pedidos, orçamentos, compras/PDV, financeiro e histórico. A lista de títulos detalha os saldos dos pedidos (não somar os dois novamente).
+- Lembretes: banco de dados, painel persistente sem descarte, sincronização a cada 30 segundos enquanto o sistema está aberto, adiamento e conclusão dentro da solicitação. Não são notificações push com navegador fechado; reaparecem ao entrar. Lembretes antigos são mantidos como tarefas manuais, mesmo quando já há orçamento/pedido, pois a finalidade original não foi registrada.
+- Busca global pela lupa do cabeçalho. Estoque separado em central, consignado e total; PDV só usa central.
+- Compras de faltantes podem conter vários insumos; cada item pode ser corrigido no detalhe da compra. A entrada reavalia disponibilidade sem avançar a produção automaticamente.
+- Gerenciar/arquivo: cancelamento, inativação e arquivamento sem exclusão de histórico. Estornos financeiros de valores já pagos ficam pendentes para conciliação. A devolução usa o valor bruto; taxas eventualmente devolvidas devem ser conciliadas separadamente. Cancelar PDV exige retorno físico dos produtos. Compras já consumidas/reservadas e remessas com prestação posterior têm cancelamento bloqueado.
+- Migrações incrementais 0005/0006. A cronologia antiga importa somente a data de cadastro conhecida, identificando autor como Sistema; não inventa mudanças históricas.
+- Testes: `python manage.py test erp` (52 testes neste ciclo). Validação local em SQLite; MySQL não foi executado nesta instalação. Para banco SQLite isolado pode-se definir `DB_SQLITE_PATH` sem trocar o banco principal.
+
+Roteiro de conferência: crie uma solicitação com lembrete, abra/adie/conclua a tarefa; gere um orçamento com dois itens e converta; confira as duas demandas, teste bloqueio por insumo e compra de faltantes; finalize uma demanda e confirme que a entrega segue bloqueada; finalize a outra, registre recebimento e entrega; consulte as seis abas do cliente e a distribuição de consignados.
+
 As alterações são incrementais. Não execute `seed_demo` novamente na base que já contém seus cadastros.
 
 - Solicitações com busca de cliente e cadastro rápido sem sair da tela.

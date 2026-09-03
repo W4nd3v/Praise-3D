@@ -18,5 +18,9 @@ class CurrentCompanyMiddleware:
                 request.session["company_id"] = membership.company_id
             elif request.user.is_superuser:
                 request.company = Company.objects.filter(active=True).first()
-        return self.get_response(request)
-
+        from .activity import current_actor
+        token = current_actor.set(request.user if request.user.is_authenticated else None)
+        try:
+            return self.get_response(request)
+        finally:
+            current_actor.reset(token)

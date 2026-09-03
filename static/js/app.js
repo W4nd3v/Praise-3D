@@ -213,4 +213,32 @@ function initMessages(root=document) {
 document.addEventListener('DOMContentLoaded',()=>{
   initCompositionEditors(document);initUi(document);initMessages(document);updateQuotePreview();
   document.querySelector('[data-toggle-sidebar]')?.addEventListener('click',()=>document.querySelector('.sidebar')?.classList.toggle('open'));
+  const params=new URLSearchParams(location.search);
+  document.querySelectorAll('form[data-filters] [name]').forEach(field=>{if(params.has(field.name))field.value=params.get(field.name)});
+  document.querySelectorAll('[data-tabs][data-initial-tab]').forEach(group=>[...group.querySelectorAll('[data-tab]')].find(b=>b.dataset.tab===group.dataset.initialTab)?.click());
+  document.querySelectorAll('dialog[data-auto-open="1"], dialog[data-auto-open="True"]').forEach(dialog=>dialog.showModal());
+  const host=document.getElementById('reminder-host'), dialog=document.getElementById('reminder-snooze-dialog'), form=dialog?.querySelector('form');
+  let polling=false;
+  async function refreshReminders(force=false){
+    if(!host || polling || (!force && (dialog?.open || host.matches(':focus-within'))))return;
+    polling=true;
+    try{const response=await fetch(host.dataset.feed,{headers:{'Accept':'application/json'}});if(!response.ok)return;const data=await response.json();
+      const expanded=host.querySelector('.expanded');host.innerHTML=data.html;if(expanded)host.querySelector('.reminder-persistent')?.classList.add('expanded');
+      document.querySelectorAll('[data-reminder-count]').forEach(b=>{b.textContent=data.count;b.hidden=!data.count});
+      document.querySelectorAll('[data-reminder-total]').forEach(b=>b.textContent=data.count);
+      document.querySelectorAll('[data-reminder-task]').forEach(a=>a.hidden=!data.request_ids.includes(Number(a.dataset.reminderTask)));
+    }catch(error){/* Keep the last visible reminders during a network failure. */}finally{polling=false}
+  }
+  document.addEventListener('click',event=>{
+    const button=event.target.closest('[data-snooze-id]');
+    if(button){form.action=`/lembretes/${button.dataset.snoozeId}/adiar/`;form.elements.version.value=button.dataset.version;form.querySelector('.form-error').hidden=true;dialog.showModal()}
+    if(event.target.closest('[data-expand-reminders]'))host.querySelector('.reminder-persistent')?.classList.toggle('expanded');
+  });
+  form?.elements.delay.addEventListener('change',()=>{const custom=form.elements.delay.value==='custom';form.querySelector('[data-custom-reminder]').hidden=!custom;form.elements.when.required=custom});
+  // Capture before the generic double-submit handler: failures must remain retryable.
+  form?.addEventListener('submit',async event=>{event.preventDefault();if(form.dataset.busy)return;form.dataset.busy='1';
+    try{const response=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{'X-Requested-With':'XMLHttpRequest'}});const data=await response.json();if(!response.ok)throw new Error(data.error || 'Não foi possível adiar.');dialog.close();await refreshReminders(true)}catch(error){showFormError(form,error.message)}finally{delete form.dataset.busy}
+  },true);
+  setInterval(()=>refreshReminders(),30000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshReminders()});
 });

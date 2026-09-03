@@ -6,3 +6,5 @@ class ErpConfig(AppConfig):
     name = "erp"
     verbose_name = "Praise 3D ERP"
 
+    def ready(self):
+        from . import activity

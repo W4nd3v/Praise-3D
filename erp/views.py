@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from django.db.models import Count, F, Q, Sum
 from django.http import FileResponse, HttpResponse, JsonResponse
@@ -97,6 +98,8 @@ def company_required(view):
         if not getattr(request, "company", None):
             messages.error(request, "Seu usuário ainda não está vinculado a uma empresa.")
             return redirect("logout")
+        if request.method == "POST" and getattr(getattr(request, "membership", None), "role", "viewer") == "viewer" and not request.user.is_superuser:
+            raise PermissionDenied("Seu perfil é somente leitura.")
         return view(request, *args, **kwargs)
     return wrapped
 
@@ -155,8 +158,11 @@ def is_company_admin(request):
 
 @company_required
 def dashboard(request):
+    from .operations import dashboard_operations, operating_demands, sort_demands
+    from .reminders import refresh_due, visible_reminders
     company = request.company
-    demands = ProductionDemand.objects.filter(company=company, active=True).select_related("order__customer", "product", "printer")
+    refresh_due(company)
+    demands = operating_demands(company)
     products_low = Product.objects.filter(company=company, active=True, current_stock__lte=F("minimum_stock"))
     filaments_low = Filament.objects.filter(company=company, active=True).filter(Q(minimum_rolls__isnull=False, closed_rolls__lte=F("minimum_rolls")) | Q(minimum_rolls__isnull=True, closed_rolls__lte=company.default_filament_minimum))
     context = {
@@ -173,7 +179,7 @@ def dashboard(request):
             ("Estoques abaixo do mínimo", products_low.count() + filaments_low.count(), "stock", "red"),
             ("Cálculos pendentes", Order.objects.filter(company=company, active=True, calculation_status="pending").count(), "orders", "violet"),
         ],
-        "demands": demands.exclude(stage="ready")[:10],
+        "demands": sort_demands(list(demands.exclude(stage="ready")))[:10],
         "ready": demands.filter(stage="ready", order__delivered_at__isnull=True)[:7],
         "pending_requests": QuoteRequest.objects.filter(company=company, active=True, status__in=["new", "analysis", "waiting"]).select_related("customer")[:5],
         "waiting_quotes": Quote.objects.filter(company=company, active=True, status__in=["sent", "waiting", "draft"]).select_related("customer")[:5],
@@ -181,6 +187,8 @@ def dashboard(request):
         "products_low": products_low[:4],
         "filaments_low": filaments_low[:4],
     }
+    context.update(dashboard_operations(company, list(visible_reminders(request).filter(status="due"))))
+    context["cards"][6] = ("Entregas pendentes", len(context["ready_orders"]), "orders", "orange")
     return render(request, "erp/dashboard.html", context)
 
 
@@ -209,6 +217,12 @@ def requests_page(request):
                 origin=request.POST.get("origin", "other"),
                 reminder_at=reminder,
             )
+            if reminder:
+                purpose = request.POST.get("reminder_purpose", "manual")
+                if purpose not in {"manual", "quote", "order"}:
+                    raise ValidationError("Finalidade do lembrete inválida.")
+                item.reminder.purpose = purpose
+                item.reminder.save(update_fields=["purpose"])
             finish_once(operation, item)
             messages.success(request, f"Solicitação {item.code} criada.")
             action = request.POST.get("after_save")
@@ -223,13 +237,21 @@ def requests_page(request):
             messages.error(request, "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc))
             transaction.set_rollback(True)
             return redirect("requests")
+    from .operations import visible_records
     context = common_context(company)
     context.update({
         "title": "Solicitações",
-        "requests_list": QuoteRequest.objects.filter(company=company, active=True).select_related("customer")[:30],
+        "requests_list": visible_records(QuoteRequest, company).filter(active=True).select_related("customer", "reminder"),
         "idempotency_key": uuid.uuid4(),
         "today": timezone.localdate(),
     })
+    if request.GET.get("reminders") == "due":
+        from .reminders import refresh_due
+        refresh_due(company)
+        context["requests_list"] = context["requests_list"].filter(reminder__status="due")
+    if request.GET.get("q"):
+        context["requests_list"] = context["requests_list"].filter(Q(code__icontains=request.GET["q"]) | Q(customer__name__icontains=request.GET["q"]))
+    context["selected_customer"] = request.GET.get("customer", "")
     return render(request, "erp/requests.html", context)
 
 
@@ -286,10 +308,14 @@ def request_direct_order(request, pk):
 @company_required
 def quotes_page(request):
     company = request.company
-    quotes = Quote.objects.filter(company=company, active=True).select_related("customer", "request", "composition")
-    selected = quotes.filter(pk=request.GET.get("selected")).first() or quotes.first()
+    from .operations import visible_records
+    quotes = visible_records(Quote, company, request.GET.get("archived") == "1").filter(active=True).select_related("customer", "request", "composition")
+    if request.GET.get("q"): quotes = quotes.filter(Q(code__icontains=request.GET["q"]) | Q(customer__name__icontains=request.GET["q"]))
+    if request.GET.get("status") == "waiting": quotes = quotes.filter(status__in=["sent", "waiting"])
+    elif request.GET.get("status"): quotes = quotes.filter(status=request.GET["status"])
+    selected = get_object_or_404(Quote, pk=request.GET["selected"], company=company) if request.GET.get("selected", "").isdigit() else quotes.first()
     context = common_context(company)
-    context.update({"title": "Orçamentos", "quotes_list": quotes, "selected": selected, "idempotency_key": uuid.uuid4()})
+    context.update({"title": "Orçamentos", "quotes_list": quotes, "selected": selected, "idempotency_key": uuid.uuid4(), "quote_statuses": Quote.STATUSES})
     return render(request, "erp/quotes.html", context)
 
 
@@ -333,12 +359,8 @@ def convert_quote(request, pk):
 
 @company_required
 def orders_page(request):
-    company = request.company
-    orders = Order.objects.filter(company=company, active=True).select_related("customer", "composition").prefetch_related("demands")
-    selected = orders.filter(pk=request.GET.get("selected")).first() or orders.first()
-    context = common_context(company)
-    context.update({"title": "Pedidos", "orders_list": orders, "selected": selected, "idempotency_key": uuid.uuid4()})
-    return render(request, "erp/orders.html", context)
+    from .operation_views import orders_view
+    return orders_view(request)
 
 
 @require_POST
@@ -357,9 +379,12 @@ def order_payment(request, pk):
 
 @require_POST
 @company_required
+@transaction.atomic
 def deliver_order(request, pk):
-    order = get_object_or_404(Order, pk=pk, company=request.company, active=True)
-    if not order.demands.filter(stage="ready").exists():
+    order = get_object_or_404(Order.objects.select_for_update(), pk=pk, company=request.company, active=True)
+    if order.cancelled_at:
+        messages.error(request, "Pedido cancelado não pode ser entregue.")
+    elif not order.demands.filter(active=True).exists() or order.demands.filter(active=True).exclude(stage="ready").exists():
         messages.error(request, "O pedido precisa estar pronto antes da entrega.")
     elif order.delivered_at:
         messages.info(request, "Entrega já registrada.")
@@ -372,18 +397,8 @@ def deliver_order(request, pk):
 
 @company_required
 def production_page(request):
-    company = request.company
-    demands = ProductionDemand.objects.filter(company=company, active=True).select_related("order__customer", "order__composition", "product", "printer")
-    operational = demands.filter(stage__in=["material", "queue", "printing"]).filter(Q(order__isnull=True) | Q(order__cancelled_at__isnull=True, order__active=True))
-    selected = demands.filter(pk=request.GET.get("selected")).first() or operational.first() or demands.filter(stage="art").first() or demands.first()
-    selected_parts = []
-    if selected:
-        composition = selected.order.composition if selected.order else (selected.product.composition if selected.product else None)
-        if composition:
-            selected_parts = ManufacturingPart.objects.filter(item__composition=composition, active=True, item__active=True).select_related("item")
-    context = common_context(company)
-    context.update({"title": "Produção", "demands": operational, "selected": selected, "selected_parts": selected_parts, "idempotency_key": uuid.uuid4(), "ready_demands": demands.filter(stage="ready", order__delivered_at__isnull=True)[:8]})
-    return render(request, "erp/production.html", context)
+    from .operation_views import production_view
+    return production_view(request)
 
 
 @require_POST
@@ -391,8 +406,12 @@ def production_page(request):
 def production_advance(request, pk):
     demand = get_object_or_404(ProductionDemand, pk=pk, company=request.company, active=True)
     try:
-        advance_demand(demand, request.POST.get("stage"), request.user)
+        changed = advance_demand(demand, request.POST.get("stage"), request.user)
         messages.success(request, "Etapa atualizada.")
+        if changed.order_id and request.POST.get("stage") == "ready":
+            from .operations import order_state
+            if order_state(changed.order)["all_ready"]:
+                return redirect(f"/producao/?order={changed.order_id}&selected={pk}&completed={changed.order_id}")
     except ValidationError as exc:
         messages.error(request, "; ".join(exc.messages))
     return redirect(f"/producao/?selected={pk}")
@@ -469,7 +488,8 @@ def catalog_page(request):
             messages.error(request, "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc))
             transaction.set_rollback(True)
             return redirect("catalog")
-    products = Product.objects.filter(company=company, active=True).select_related("composition", "category_ref", "product_type").order_by("category_ref__name", "name")
+    from .operations import visible_records
+    products = visible_records(Product, company).filter(active=True).select_related("composition", "category_ref", "product_type").order_by("category_ref__name", "name")
     if request.GET.get("category"):
         products = products.filter(category_ref_id=request.GET.get("category"))
     if request.GET.get("type"):
@@ -510,10 +530,18 @@ def stock_page(request):
             messages.error(request, "; ".join(exc.messages))
         return redirect("stock")
     products = Product.objects.filter(company=company, active=True)
+    from .operations import stock_distribution
+    if request.GET.get("product", "").isdigit(): products = products.filter(pk=request.GET["product"])
+    if request.GET.get("q"): products = products.filter(Q(sku__icontains=request.GET["q"]) | Q(name__icontains=request.GET["q"]))
+    stock_products = list(products)
+    for product in stock_products:
+        product.distribution = stock_distribution(product)
+        product.consigned_stock = sum((row["balance"].quantity for row in product.distribution), Decimal("0"))
+        product.total_stock = product.current_stock + product.consigned_stock
     context = common_context(company)
     context.update({
         "title": "Estoque",
-        "stock_products": products,
+        "stock_products": stock_products,
         "movements": StockMovement.objects.filter(company=company, active=True).select_related("product", "user")[:30],
         "low_products": products.filter(current_stock__lte=F("minimum_stock")),
         "replenishments": ProductionDemand.objects.filter(company=company, active=True, origin="replenishment").exclude(stage="ready")[:10],
@@ -659,14 +687,18 @@ def materials_page(request):
             messages.error(request, "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc))
             transaction.set_rollback(True)
             return redirect("materials")
-    filaments = Filament.objects.filter(company=company, active=True).select_related("family")
-    supplies = Supply.objects.filter(company=company, active=True)
+    from .operations import visible_records
+    filaments = visible_records(Filament, company).filter(active=True).select_related("family")
+    supplies = visible_records(Supply, company).filter(active=True)
+    if request.GET.get("q"):
+        filaments = filaments.filter(Q(family__name__icontains=request.GET["q"]) | Q(color__icontains=request.GET["q"]))
+        supplies = supplies.filter(name__icontains=request.GET["q"])
     context = common_context(company)
     context.update({
         "title": "Materiais",
         "filaments": filaments,
         "materials_supplies": supplies,
-        "purchases": Purchase.objects.filter(company=company, active=True).select_related("payment_method", "account").prefetch_related("items__filament", "items__supply")[:20],
+        "purchases": visible_records(Purchase, company).filter(active=True).select_related("payment_method", "account").prefetch_related("items__filament", "items__supply"),
         "material_movements": MaterialMovement.objects.filter(company=company, active=True).select_related("filament__family", "supply")[:30],
         "low_filaments": [item for item in filaments if item.stock_status != "ok"],
         "low_supplies": [item for item in supplies if item.stock_status != "ok"],
@@ -721,25 +753,20 @@ def customers_page(request):
             return redirect("customer_detail", pk=customer.pk)
         except Exception as exc:
             messages.error(request, f"Não foi possível cadastrar: {exc}")
-    context = {"title": "Clientes", "customers_list": Customer.objects.filter(company=company, active=True).annotate(order_count=Count("orders"))}
+    from .operations import visible_records
+    customers = visible_records(Customer, company, request.GET.get("archived") == "1").annotate(order_count=Count("orders"))
+    if request.GET.get("status", "active") != "all": customers = customers.filter(active=request.GET.get("status", "active") == "active")
+    if request.GET.get("q"): customers = customers.filter(Q(name__icontains=request.GET["q"]) | Q(phone__icontains=request.GET["q"]))
+    if request.GET.get("open_orders"): customers = customers.filter(orders__delivered_at__isnull=True, orders__cancelled_at__isnull=True, orders__active=True).distinct()
+    if request.GET.get("balance"): customers = [c for c in customers if c.balance_due > 0]
+    context = {"title": "Clientes", "customers_list": customers}
     return render(request, "erp/customers.html", context)
 
 
 @company_required
 def customer_detail(request, pk):
-    customer = get_object_or_404(Customer, pk=pk, company=request.company, active=True)
-    if request.method == "POST":
-        for field in ["name", "legal_name", "document", "phone", "whatsapp", "instagram", "email", "city", "notes"]:
-            setattr(customer, field, request.POST.get(field, "").strip())
-        customer.state = request.POST.get("state", "").strip().upper()
-        customer.save()
-        messages.success(request, "Dados do cliente atualizados.")
-        return redirect("customer_detail", pk=customer.pk)
-    return render(request, "erp/customer_detail.html", {
-        "title": customer.name, "customer": customer,
-        "orders": customer.orders.filter(active=True)[:20], "sales": customer.sales.filter(active=True)[:20],
-        "payments": customer.payments.filter(active=True)[:20],
-    })
+    from .operation_views import customer_360
+    return customer_360(request, pk)
 
 
 @company_required
@@ -813,10 +840,18 @@ def consignment_page(request):
         "title": "Consignação",
         "stores": ConsignedStore.objects.filter(company=company, active=True),
         "balances": ConsignmentBalance.objects.filter(company=company, active=True).select_related("store", "product"),
-        "shipments": ConsignmentShipment.objects.filter(company=company, active=True).select_related("store")[:15],
-        "settlements": ConsignmentSettlement.objects.filter(company=company, active=True).select_related("store").prefetch_related("items__product")[:15],
+        "shipments": ConsignmentShipment.objects.filter(company=company, active=True).select_related("store"),
+        "settlements": ConsignmentSettlement.objects.filter(company=company, active=True).select_related("store").prefetch_related("items__product"),
         "today": timezone.localdate(),
     })
+    if request.GET.get("store", "").isdigit():
+        for key in ["balances", "shipments", "settlements"]: context[key] = context[key].filter(store_id=request.GET["store"])
+    if request.GET.get("shipment", "").isdigit(): context["shipments"] = context["shipments"].filter(pk=request.GET["shipment"])
+    if request.GET.get("q"):
+        context["stores"] = context["stores"].filter(name__icontains=request.GET["q"])
+        for key in ["balances", "shipments", "settlements"]: context[key] = context[key].filter(store__name__icontains=request.GET["q"])
+    from .models import ArchivedRecord
+    context["shipments"] = context["shipments"].exclude(pk__in=ArchivedRecord.objects.filter(company=company, source_model="erp.ConsignmentShipment", archived=True).values("source_id"))
     return render(request, "erp/consignment.html", context)
 
 
@@ -936,9 +971,18 @@ def finance_page(request):
     accounts = FinancialAccount.objects.filter(company=company, active=True)
     received_month = entries.filter(direction="in", status="paid", issue_date__month=timezone.localdate().month, issue_date__year=timezone.localdate().year).aggregate(total=Sum("net_amount"))["total"] or 0
     paid_month = entries.filter(direction="out", status="paid", issue_date__month=timezone.localdate().month, issue_date__year=timezone.localdate().year).aggregate(total=Sum("net_amount"))["total"] or 0
+    filtered = entries
+    if request.GET.get("entry", "").isdigit(): filtered = filtered.filter(pk=request.GET["entry"])
+    if request.GET.get("customer", "").isdigit(): filtered = filtered.filter(customer_id=request.GET["customer"])
+    if request.GET.get("overdue"): filtered = filtered.filter(status="pending", due_date__lt=timezone.localdate())
+    if request.GET.get("status"): filtered = filtered.filter(status=request.GET["status"])
+    if request.GET.get("q"): filtered = filtered.filter(Q(code__icontains=request.GET["q"]) | Q(description__icontains=request.GET["q"]) | Q(customer__name__icontains=request.GET["q"]))
+    from .operations import record_url
+    shown = list(filtered[:200])
+    for entry in shown: entry.origin_url = record_url(entry.source_type, entry.source_id) if str(entry.source_id).isdigit() else ""
     context = common_context(company)
     context.update({
-        "title": "Financeiro", "entries": entries[:50], "finance_accounts": accounts,
+        "title": "Financeiro", "entries": shown, "finance_accounts": accounts,
         "current_balance": sum((item.balance for item in accounts), Decimal("0")), "received_month": received_month,
         "paid_month": paid_month, "profit_month": received_month - paid_month,
         "receivable": entries.filter(direction="in", status="pending").aggregate(total=Sum("net_amount"))["total"] or 0,
@@ -1099,6 +1143,9 @@ def composition_page(request, pk):
     if request.method == "POST":
         action = request.POST.get("action")
         try:
+            if hasattr(composition, "order"):
+                from .services import validate_order_composition_edit
+                validate_order_composition_edit(composition.order)
             if action in {"item", "item_update", "part", "supply"}:
                 quantity = to_decimal(request.POST.get("quantity"), "0")
                 if not quantity.is_finite() or quantity <= 0:
@@ -1227,6 +1274,9 @@ def composition_page(request, pk):
 def composition_calculate(request, pk):
     composition = get_object_or_404(Composition, pk=pk, company=request.company, active=True)
     try:
+        if hasattr(composition, "order"):
+            from .services import validate_order_composition_edit
+            validate_order_composition_edit(composition.order)
         composition.recalculate()
         if hasattr(composition, "order"):
             complete_order_calculation(composition.order)

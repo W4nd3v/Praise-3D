@@ -249,13 +249,22 @@ def quote_to_order(quote, key, deadline=None):
     quote.request.status = "ordered"
     quote.save(update_fields=["status", "updated_at"])
     quote.request.save(update_fields=["status", "updated_at"])
+    sync_order_demands(order)
     finish_once(record, order)
     return order
+
+
+def validate_order_composition_edit(order):
+    if order.cancelled_at or order.delivered_at:
+        raise ValidationError("Pedido encerrado: composição preservada.")
+    if order.demands.filter(active=True).exclude(stage__in=["art", "material"]).exists():
+        raise ValidationError("Retorne as produções para arte/material antes de alterar a composição. Reservas e consumos devem ser reconciliados primeiro.")
 
 
 @transaction.atomic
 def complete_order_calculation(order):
     order = Order.objects.select_for_update().select_related("composition").get(pk=order.pk)
+    validate_order_composition_edit(order)
     values = order.composition.recalculate()
     if not order.quote_id:
         order.value = values["final_price"]
@@ -265,7 +274,36 @@ def complete_order_calculation(order):
     order.calculation_status = "completed"
     order.snapshot = order.composition.snapshot
     order.save(update_fields=["value", "predicted_cost", "actual_cost", "calculation_status", "snapshot", "updated_at"])
+    sync_order_demands(order)
     return order
+
+
+def sync_order_demands(order):
+    """Divide por item somente antes da produção; preserva códigos e histórico."""
+    demands = list(order.demands.filter(active=True).order_by("pk"))
+    items = list(order.composition.items.filter(active=True))
+    if not items or any(d.stage not in {"art", "material"} or d.reserved_supplies for d in demands):
+        return
+    if len(demands) == 1 and demands[0].composition_item_id is None:
+        demand = demands[0]
+        demand.composition_item = items[0]
+        demand.item_name = items[0].name
+        demand.quantity = items[0].quantity
+        demand.save(update_fields=["composition_item", "item_name", "quantity", "updated_at"])
+    known = {d.composition_item_id for d in demands if d.composition_item_id}
+    active_ids = {item.pk for item in items}
+    for demand in demands:
+        if demand.composition_item_id and demand.composition_item_id not in active_ids:
+            demand.active = False
+            demand.save(update_fields=["active", "updated_at"])
+        elif demand.composition_item_id:
+            item = next(i for i in items if i.pk == demand.composition_item_id)
+            demand.item_name, demand.quantity = item.name, item.quantity
+            demand.save(update_fields=["item_name", "quantity", "updated_at"])
+    for item in items:
+        if item.pk not in known:
+            ProductionDemand.objects.create(company=order.company, code=Sequence.next(order.company, "OP"), origin="order", order=order,
+                composition_item=item, item_name=item.name, quantity=item.quantity, stage="art", deadline=order.deadline, priority=order.priority_level != "normal")
 
 
 @transaction.atomic
@@ -287,10 +325,13 @@ def move_product_stock(product, quantity, movement_type, user=None, source=None,
     )
 
 
-def composition_supply_requirements(composition, multiplier=1):
+def composition_supply_requirements(composition, multiplier=1, item_id=None):
     requirements = {}
     multiplier = to_decimal(multiplier, "1")
-    for item in composition.items.filter(active=True).prefetch_related("supplies__supply"):
+    items = composition.items.filter(active=True)
+    if item_id:
+        items = items.filter(pk=item_id)
+    for item in items.prefetch_related("supplies__supply"):
         for use in item.supplies.filter(active=True):
             entry = requirements.setdefault(use.supply_id, {"supply": use.supply, "quantity": Decimal("0")})
             entry["quantity"] += use.quantity * item.quantity * multiplier
@@ -302,7 +343,7 @@ def reserve_composition_supplies(demand, composition, multiplier=1):
         return demand.reserved_supplies
     locked = []
     insufficient = []
-    for supply_id, entry in composition_supply_requirements(composition, multiplier).items():
+    for supply_id, entry in composition_supply_requirements(composition, multiplier, demand.composition_item_id).items():
         supply = entry["supply"].__class__.objects.select_for_update().get(pk=supply_id)
         locked.append((supply, entry["quantity"]))
         if supply.available_stock < entry["quantity"]:
@@ -338,9 +379,11 @@ def reserve_composition_supplies(demand, composition, multiplier=1):
 
 
 def deduct_composition_supplies(composition, multiplier, source, user=None):
-    for supply_id, entry in composition_supply_requirements(composition, multiplier).items():
+    consumed = {}
+    for supply_id, entry in composition_supply_requirements(composition, multiplier, getattr(source, "composition_item_id", None)).items():
         supply = entry["supply"].__class__.objects.select_for_update().get(pk=supply_id)
         used = entry["quantity"]
+        consumed[str(supply_id)] = str(used)
         supply.physical_stock -= used
         reserved = to_decimal(getattr(source, "reserved_supplies", {}).get(str(supply.pk), "0"))
         if reserved:
@@ -365,25 +408,63 @@ def deduct_composition_supplies(composition, multiplier, source, user=None):
                 source_type=source._meta.label,
                 source_id=str(source.pk),
             )
+    return consumed
+
+
+def release_demand_reservations(demand):
+    from .models import Supply
+    for pk, quantity in demand.reserved_supplies.items():
+        supply = Supply.objects.select_for_update().get(pk=pk, company=demand.company)
+        supply.reserved_stock = max(Decimal("0"), supply.reserved_stock - to_decimal(quantity))
+        supply.save(update_fields=["reserved_stock", "updated_at"])
+    demand.reserved_supplies = {}
 
 
 @transaction.atomic
 def advance_demand(demand, next_stage, user=None):
+    from .models import Supply
+    from .activity import log_event
+    from .operations import order_state
     demand = ProductionDemand.objects.select_for_update().select_related("order__composition", "product__composition").get(pk=demand.pk)
     stages = ["art", "material", "queue", "printing", "ready"]
     if next_stage not in stages:
         raise ValidationError("Etapa de produção inválida.")
+    if demand.order_id:
+        order = Order.objects.select_for_update().get(pk=demand.order_id)
+        if order.cancelled_at or order.delivered_at:
+            raise ValidationError("Pedido cancelado ou entregue não pode ter a produção alterada.")
     if next_stage == demand.stage:
         return demand
-    if stages.index(next_stage) < stages.index(demand.stage):
-        raise ValidationError("Use um ajuste administrativo para retroceder uma produção.")
-    if next_stage != demand.stage and stages.index(next_stage) != stages.index(demand.stage) + 1:
-        raise ValidationError("Avance uma etapa por vez.")
-    if next_stage in {"material", "queue"} and demand.order and demand.order.calculation_status != "completed":
-        raise ValidationError("Conclua o cálculo do pedido antes de avançar para Aguardando impressão.")
+    if next_stage in {"material", "queue", "printing", "ready"} and demand.order and demand.order.calculation_status != "completed":
+        raise ValidationError("Conclua o cálculo do pedido antes de avançar a produção.")
     composition = demand.order.composition if demand.order else (demand.product.composition if demand.product else None)
     multiplier = Decimal("1") if demand.order else demand.quantity
-    if next_stage == "queue" and composition:
+    previous = demand.stage
+    if previous == "ready":
+        if demand.completed_stock_movement and demand.product:
+            product = demand.product.__class__.objects.select_for_update().get(pk=demand.product_id)
+            if product.current_stock < demand.quantity:
+                raise ValidationError("A reposição já teve saída de estoque. Regularize o saldo antes de reabrir.")
+            move_product_stock(product, -demand.quantity, "adjustment", user, demand, "Estorno da reposição reaberta")
+            demand.completed_stock_movement = False
+        consumed = demand.consumed_supplies
+        if not consumed:
+            consumed = {}
+            for row in MaterialMovement.objects.filter(company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk), supply__isnull=False).values("supply_id").annotate(total=Sum("quantity")):
+                if row["total"] < 0:
+                    consumed[str(row["supply_id"])] = str(-row["total"])
+        for pk, quantity in consumed.items():
+            supply = Supply.objects.select_for_update().get(pk=pk, company=demand.company)
+            amount = to_decimal(quantity)
+            supply.physical_stock += amount
+            supply.save(update_fields=["physical_stock", "updated_at"])
+            MaterialMovement.objects.create(company=demand.company, movement_type="adjustment", supply=supply, quantity=amount,
+                source_type="erp.ProductionDemand", source_id=str(demand.pk), user=user, note="Estorno de consumo ao reabrir produção")
+        demand.consumed_supplies = {}
+        demand.ready_at = None
+    if next_stage in {"art", "material"}:
+        release_demand_reservations(demand)
+    elif composition and (next_stage in {"queue", "printing"} or (next_stage == "ready" and previous not in {"queue", "printing"})):
         reserve_composition_supplies(demand, composition, multiplier)
     demand.stage = next_stage
     if next_stage == "ready":
@@ -392,15 +473,23 @@ def advance_demand(demand, next_stage, user=None):
             move_product_stock(demand.product, demand.quantity, "production", user, demand, "Entrada automática da reposição concluída")
             demand.completed_stock_movement = True
         if composition:
-            deduct_composition_supplies(composition, multiplier, demand, user)
+            demand.consumed_supplies = deduct_composition_supplies(composition, multiplier, demand, user)
             demand.reserved_supplies = {}
-    demand.save(update_fields=["stage", "reserved_supplies", "ready_at", "completed_stock_movement", "updated_at"])
+    demand.save(update_fields=["stage", "reserved_supplies", "consumed_supplies", "ready_at", "completed_stock_movement", "updated_at"])
+    if demand.order_id and next_stage == "ready" and order_state(demand.order)["all_ready"]:
+        log_event(demand.order, "order.ready", "Todas as produções concluídas. Pedido aguardando entrega.", user=user,
+            key=f"order:{demand.order_id}:ready:{demand.ready_at.isoformat()}")
+    Alert.objects.filter(company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk), title__startswith="Insumos insuficientes", resolved_at__isnull=True).update(resolved_at=timezone.now())
     return demand
 
 
 @transaction.atomic
 def register_production_failure(demand, part, failure_percent, reason, notes="", key=None):
     demand = ProductionDemand.objects.select_for_update().select_related("order__composition", "product__composition").get(pk=demand.pk)
+    if not demand.active or (demand.order_id and (demand.order.cancelled_at or demand.order.delivered_at)):
+        raise ValidationError("Produção encerrada.")
+    if demand.composition_item_id and part.item_id != demand.composition_item_id:
+        raise ValidationError("A parte não pertence a esta demanda.")
     operation, created = begin_once(demand.company, key, "production_failure")
     if not created:
         return previous_result(operation)
@@ -531,6 +620,8 @@ def create_sale(company, customer, method, cart, account, key, user=None):
 @transaction.atomic
 def record_order_payment(order, method, account, amount=None, key=None, received=True, notes=""):
     order = Order.objects.select_for_update().get(pk=order.pk)
+    if order.cancelled_at:
+        raise ValidationError("Pedido cancelado não pode receber pagamento.")
     validate_company(order.company, method, account)
     record, created = begin_once(order.company, key, "order_payment")
     if not created:
@@ -622,9 +713,19 @@ def settle_financial_entry(entry):
     entry = FinancialEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.status == "cancelled":
         raise ValidationError("Lançamento cancelado não pode ser liquidado.")
+    if entry.status == "paid":
+        return entry
     entry.status = "paid"
     entry.paid_at = timezone.now()
     entry.save(update_fields=["status", "paid_at", "updated_at"])
+    payment = Payment.objects.filter(financial_entry=entry).select_related("order").first()
+    if payment:
+        payment.status = "received"
+        payment.save(update_fields=["status", "updated_at"])
+        if payment.order:
+            order = Order.objects.select_for_update().get(pk=payment.order_id)
+            order.financial_status = "paid" if order.balance <= 0 else ("partial" if order.received else "pending")
+            order.save(update_fields=["financial_status", "updated_at"])
     return entry
 
 
@@ -654,6 +755,8 @@ def close_roll(filament, user=None):
 @transaction.atomic
 def complete_purchase(purchase, account, user=None):
     purchase = Purchase.objects.select_for_update().prefetch_related("items__filament__family", "items__supply").get(pk=purchase.pk)
+    if purchase.cancelled_at:
+        raise ValidationError("Compra cancelada não pode ser confirmada.")
     if purchase.completed_at:
         return purchase
     validate_company(purchase.company, account)
@@ -684,8 +787,9 @@ def complete_purchase(purchase, account, user=None):
             supply.save(update_fields=["physical_stock", "unit_cost", "updated_at"])
             MaterialMovement.objects.create(company=purchase.company, movement_type="purchase", supply=supply, quantity=item.quantity, source_type="erp.Purchase", source_id=str(purchase.pk), note=purchase.code, user=user)
     purchase.total = money(total)
+    purchase.account = account
     purchase.completed_at = timezone.now()
-    purchase.save(update_fields=["total", "completed_at", "updated_at"])
+    purchase.save(update_fields=["total", "account", "completed_at", "updated_at"])
     entries = create_manual_entries(
         purchase.company,
         "out",
@@ -704,15 +808,19 @@ def complete_purchase(purchase, account, user=None):
         entry.source_type = "erp.Purchase"
         entry.source_id = str(purchase.pk)
         entry.save(update_fields=["source_type", "source_id", "updated_at"])
+    from .operations import refresh_material_alerts
+    refresh_material_alerts(purchase.company)
     return purchase
 
 
 @transaction.atomic
-def correct_purchase(purchase, quantity, unit_cost, reason, user=None):
+def correct_purchase(purchase, quantity, unit_cost, reason, user=None, item_id=None):
     purchase = Purchase.objects.select_for_update().prefetch_related("items__filament__family", "items__supply").get(pk=purchase.pk)
+    if purchase.cancelled_at:
+        raise ValidationError("Compra cancelada não pode ser editada.")
     if not reason.strip():
         raise ValidationError("Informe o motivo da correção.")
-    item = purchase.items.first()
+    item = purchase.items.filter(pk=item_id).first() if item_id else purchase.items.first()
     if not item:
         raise ValidationError("A compra não possui item para corrigir.")
     new_quantity = to_decimal(quantity)
@@ -788,12 +896,18 @@ def correct_purchase(purchase, quantity, unit_cost, reason, user=None):
     purchase.total = new_total
     purchase.notes = (purchase.notes + f"\nCorreção: {reason}").strip()
     purchase.save(update_fields=["total", "notes", "updated_at"])
+    from .activity import log_event
+    log_event(purchase, "purchase.corrected", f"Compra corrigida: {reason}", user=user, details={"item":item.pk, "before_quantity":str(old_quantity), "after_quantity":str(new_quantity), "before_total":str(old_total), "after_total":str(new_total)})
+    from .operations import refresh_material_alerts
+    refresh_material_alerts(purchase.company)
     return purchase
 
 
 @transaction.atomic
 def complete_shipment(shipment, user=None):
     shipment = ConsignmentShipment.objects.select_for_update().prefetch_related("items__product").get(pk=shipment.pk)
+    if shipment.cancelled_at:
+        raise ValidationError("Remessa cancelada.")
     if shipment.completed_at:
         return shipment
     for item in shipment.items.all():

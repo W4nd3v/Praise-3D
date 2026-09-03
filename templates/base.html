@@ -27,6 +27,8 @@
             <a class="quick" href="{% url 'materials' %}#filamentos"><b>＋</b> Finalizar rolo</a>
         </nav>
         <div class="userbox">
+            <button class="icon-button" type="button" data-dialog="global-search-dialog" aria-label="Busca global" title="Buscar no sistema">⌕</button>
+            <a class="notification" href="{% url 'requests' %}?reminders=due" aria-label="Lembretes vencidos">♧<i data-reminder-count {% if not due_reminders %}hidden{% endif %}>{{ due_reminders|length }}</i></a>
             <span class="notification" title="Alertas">♧{% if nav_badges.alerts %}<i>{{ nav_badges.alerts }}</i>{% endif %}</span>
             <span class="avatar">{{ request.user.first_name|default:request.user.username|slice:':2'|upper }}</span>
             <span class="user-name">{{ request.user.first_name|default:request.user.username }}</span>
@@ -60,6 +62,9 @@
         <footer>© {% now 'Y' %} {{ current_company|default:'Praise 3D' }} · Todos os direitos reservados. <span>Versão 1.0.0</span></footer>
     </main>
 </div>
+<div id="reminder-host" data-feed="{% url 'reminder_feed' %}">{% include 'erp/partials/reminder_panel.html' %}</div>
+<dialog id="global-search-dialog"><form method="get" action="{% url 'global_search' %}"><div class="dialog-head"><h2>Busca global</h2><button type="button" data-close-dialog>×</button></div><div class="dialog-body"><label>Código, cliente, telefone, produto ou material<input name="q" type="search" required autofocus placeholder="PED-0001, nome, telefone, SKU..."></label></div><div class="dialog-actions"><button class="button primary">Buscar</button></div></form></dialog>
+<dialog id="reminder-snooze-dialog"><form method="post" data-reminder-snooze>{% csrf_token %}<input type="hidden" name="version"><div class="dialog-head"><h2>Adiar lembrete</h2><button type="button" data-close-dialog>×</button></div><div class="dialog-body"><label>Quando lembrar novamente?<select name="delay"><option value="5">5 minutos</option><option value="15" selected>15 minutos</option><option value="30">30 minutos</option><option value="60">1 hora</option><option value="120">2 horas</option><option value="tomorrow">Amanhã às 9h</option><option value="custom">Data e horário personalizados</option></select></label><label data-custom-reminder hidden>Data e horário<input name="when" type="datetime-local"></label><p class="form-error" hidden></p></div><div class="dialog-actions"><button class="button primary">Confirmar adiamento</button></div></form></dialog>
 <script src="{% static 'js/app.js' %}"></script>
 {% block scripts %}{% endblock %}
 </body>

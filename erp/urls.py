@@ -1,7 +1,21 @@
 from django.urls import path
 from . import views
+from . import operation_views as operation
 
 urlpatterns = [
+    path("registros/", operation.records_list, name="records_list"),
+    path("orcamentos/<int:pk>/status/", operation.quote_status, name="quote_status"),
+    path("registros/<str:kind>/<int:pk>/", operation.record_manage, name="record_manage"),
+    path("producao/<int:pk>/impressora/", operation.production_assign, name="production_assign"),
+    path("busca/", operation.global_search, name="global_search"),
+    path("lembretes/ativos/", operation.reminder_feed, name="reminder_feed"),
+    path("lembretes/<int:pk>/adiar/", operation.reminder_snooze, name="reminder_snooze"),
+    path("solicitacoes/<int:pk>/", operation.request_detail, name="request_detail"),
+    path("pedidos/<int:pk>/", operation.orders_view, name="order_detail"),
+    path("pedidos/<int:pk>/atualizar/", operation.order_update, name="order_update"),
+    path("vendas/<int:pk>/", operation.sale_detail, name="sale_detail"),
+    path("compras/<int:pk>/", operation.purchase_detail, name="purchase_detail"),
+    path("producao/<int:pk>/comprar-faltantes/", operation.purchase_shortages, name="purchase_shortages"),
     path("documentos/<int:pk>.pdf", views.issued_document_pdf, name="issued_document_pdf"),
     path("", views.dashboard, name="dashboard"),
     path("solicitacoes/", views.requests_page, name="requests"),

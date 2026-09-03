@@ -193,13 +193,13 @@ class Customer(CompanyOwned):
 
     @property
     def total_purchased(self):
-        orders = self.orders.filter(active=True).aggregate(total=Sum("value"))["total"] or Decimal("0")
+        orders = self.orders.filter(active=True, cancelled_at__isnull=True).aggregate(total=Sum("value"))["total"] or Decimal("0")
         sales = self.sales.filter(active=True, cancelled_at__isnull=True).aggregate(total=Sum("gross_amount"))["total"] or Decimal("0")
         return orders + sales
 
     @property
     def total_received(self):
-        payments = self.payments.filter(status="received").aggregate(total=Sum("gross_amount"))["total"] or Decimal("0")
+        payments = self.payments.filter(active=True, status="received", order__cancelled_at__isnull=True).aggregate(total=Sum("gross_amount"))["total"] or Decimal("0")
         sales = self.sales.filter(active=True, cancelled_at__isnull=True).aggregate(total=Sum("gross_amount"))["total"] or Decimal("0")
         return payments + sales
 
@@ -691,6 +691,7 @@ class Product(CompanyOwned):
 
 
 class Order(CompanyOwned):
+    PRIORITIES = [("normal", "Normal"), ("priority", "Prioritário"), ("urgent", "Urgente")]
     CALC_STATUSES = [("pending", "Pendente"), ("completed", "Concluído")]
     FIN_STATUSES = [("pending", "Pendente"), ("partial", "Parcialmente pago"), ("paid", "Quitado")]
     code = models.CharField(max_length=16)
@@ -701,6 +702,7 @@ class Order(CompanyOwned):
     description = models.TextField()
     deadline = models.DateField(null=True, blank=True)
     priority = models.BooleanField(default=False)
+    priority_level = models.CharField(max_length=12, choices=PRIORITIES, default="normal")
     value = models.DecimalField(**MONEY)
     predicted_cost = models.DecimalField(**MONEY)
     actual_cost = models.DecimalField(**MONEY)
@@ -733,6 +735,15 @@ class Order(CompanyOwned):
     def real_profit(self):
         return money(self.value - self.actual_cost)
 
+    @property
+    def operation(self):
+        from .operations import order_state
+        return order_state(self)
+
+    @property
+    def is_overdue(self):
+        return bool(self.deadline and self.deadline < timezone.localdate() and not self.delivered_at and not self.cancelled_at)
+
 
 class ProductionDemand(CompanyOwned):
     STAGES = [("art", "Fazer arte"), ("material", "Aguardando material"), ("queue", "Aguardando impressão"), ("printing", "Imprimindo"), ("ready", "Pronto")]
@@ -740,6 +751,7 @@ class ProductionDemand(CompanyOwned):
     code = models.CharField(max_length=16)
     origin = models.CharField(max_length=16, choices=ORIGINS)
     order = models.ForeignKey(Order, null=True, blank=True, on_delete=models.PROTECT, related_name="demands")
+    composition_item = models.ForeignKey(CompositionItem, null=True, blank=True, on_delete=models.PROTECT, related_name="demands")
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.PROTECT, related_name="demands")
     item_name = models.TextField()
     quantity = models.DecimalField(**QTY)
@@ -750,6 +762,7 @@ class ProductionDemand(CompanyOwned):
     assignee = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
     notes = models.TextField(blank=True)
     reserved_supplies = models.JSONField(default=dict, blank=True)
+    consumed_supplies = models.JSONField(default=dict, blank=True)
     ready_at = models.DateTimeField(null=True, blank=True)
     completed_stock_movement = models.BooleanField(default=False)
 
@@ -886,6 +899,8 @@ class Purchase(CompanyOwned):
     total = models.DecimalField(**MONEY)
     notes = models.TextField(blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    source_demand = models.ForeignKey(ProductionDemand, null=True, blank=True, on_delete=models.PROTECT, related_name="purchases")
 
     class Meta:
         ordering = ["-purchase_date"]
@@ -950,6 +965,7 @@ class ConsignmentShipment(CompanyOwned):
     shipment_date = models.DateField(default=timezone.localdate)
     notes = models.TextField(blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-shipment_date"]
@@ -1024,3 +1040,59 @@ class Alert(CompanyOwned):
 
     class Meta:
         ordering = ["resolved_at", "-created_at"]
+
+
+class ActivityEvent(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.PROTECT)
+    happened_at = models.DateTimeField(default=timezone.now, db_index=True)
+    kind = models.CharField(max_length=48)
+    description = models.TextField()
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    customer = models.ForeignKey(Customer, null=True, blank=True, on_delete=models.PROTECT, related_name="activity_events")
+    order = models.ForeignKey(Order, null=True, blank=True, on_delete=models.PROTECT, related_name="activity_events")
+    request = models.ForeignKey(QuoteRequest, null=True, blank=True, on_delete=models.PROTECT, related_name="activity_events")
+    source_model = models.CharField(max_length=64)
+    source_id = models.PositiveBigIntegerField()
+    event_key = models.CharField(max_length=180)
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-happened_at", "-pk"]
+        constraints = [models.UniqueConstraint(fields=["company", "event_key"], name="uniq_activity_event")]
+
+    @property
+    def url(self):
+        from .operations import record_url
+        return record_url(self.source_model, self.source_id) or (record_url("erp.Order", self.order_id) if self.order_id else record_url("erp.QuoteRequest", self.request_id) if self.request_id else record_url("erp.Customer", self.customer_id) if self.customer_id else "")
+
+
+class RequestReminder(models.Model):
+    STATUSES = [("scheduled", "Agendado"), ("due", "Vencido"), ("snoozed", "Adiado"), ("completed", "Concluído"), ("cancelled", "Cancelado")]
+    PURPOSES = [("manual", "Retornar contato / tarefa manual"), ("quote", "Criar orçamento"), ("order", "Gerar pedido")]
+    company = models.ForeignKey(Company, on_delete=models.PROTECT)
+    request = models.OneToOneField(QuoteRequest, on_delete=models.PROTECT, related_name="reminder")
+    original_at = models.DateTimeField()
+    scheduled_at = models.DateTimeField(db_index=True)
+    status = models.CharField(max_length=12, choices=STATUSES, default="scheduled")
+    purpose = models.CharField(max_length=12, choices=PURPOSES, default="manual")
+    assignee = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="assigned_reminders")
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="completed_reminders")
+    completion_mode = models.CharField(max_length=24, blank=True)
+    version = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["scheduled_at", "pk"]
+
+
+class ArchivedRecord(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.PROTECT)
+    source_model = models.CharField(max_length=64)
+    source_id = models.PositiveBigIntegerField()
+    archived_at = models.DateTimeField(default=timezone.now)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    archived = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["company", "source_model", "source_id"], name="uniq_archived_record")]

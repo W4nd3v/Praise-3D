@@ -50,7 +50,7 @@ ASGI_APPLICATION = "praise3d.asgi.application"
 
 DB_ENGINE = os.getenv("DB_ENGINE", "mysql")
 if DB_ENGINE == "sqlite":
-    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
+    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": os.getenv("DB_SQLITE_PATH", str(BASE_DIR / "db.sqlite3"))}}
 else:
     DATABASES = {"default": {
         "ENGINE": "django.db.backends.mysql",
@@ -85,4 +85,3 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 FILE_UPLOAD_PERMISSIONS = 0o640
 CSRF_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_SAMESITE = "Lax"
-
