@@ -118,6 +118,7 @@ def clone_composition(source, name=None):
                 print_minutes=part.print_minutes,
                 printer=part.printer,
                 quantity=part.quantity,
+                plate_quantity=part.plate_quantity,
             )
             part_ids[part.pk] = copied_part.pk
         CompositionSupply.objects.bulk_create([
@@ -250,6 +251,7 @@ def quote_to_order(quote, key, deadline=None):
     quote.save(update_fields=["status", "updated_at"])
     quote.request.save(update_fields=["status", "updated_at"])
     sync_order_demands(order)
+    ensure_order_advance_receivable(order)
     finish_once(record, order)
     return order
 
@@ -275,6 +277,7 @@ def complete_order_calculation(order):
     order.snapshot = order.composition.snapshot
     order.save(update_fields=["value", "predicted_cost", "actual_cost", "calculation_status", "snapshot", "updated_at"])
     sync_order_demands(order)
+    ensure_order_advance_receivable(order)
     return order
 
 
@@ -477,8 +480,9 @@ def advance_demand(demand, next_stage, user=None):
             demand.reserved_supplies = {}
     demand.save(update_fields=["stage", "reserved_supplies", "consumed_supplies", "ready_at", "completed_stock_movement", "updated_at"])
     if demand.order_id and next_stage == "ready" and order_state(demand.order)["all_ready"]:
+        ensure_order_final_receivable(demand.order, timezone.localdate(), user)
         log_event(demand.order, "order.ready", "Todas as produções concluídas. Pedido aguardando entrega.", user=user,
-            key=f"order:{demand.order_id}:ready:{demand.ready_at.isoformat()}")
+            key=f"order:{demand.order_id}:ready")
     Alert.objects.filter(company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk), title__startswith="Insumos insuficientes", resolved_at__isnull=True).update(resolved_at=timezone.now())
     return demand
 
@@ -528,9 +532,11 @@ def register_production_failure(demand, part, failure_percent, reason, notes="",
 @transaction.atomic
 def create_replenishment(product, quantity=None, user=None):
     product = product.__class__.objects.select_for_update().get(pk=product.pk)
-    quantity = to_decimal(quantity) if quantity else product.suggested_replenishment
-    if quantity <= 0:
-        raise ValidationError("A quantidade da reposição deve ser maior que zero.")
+    if not product.active:
+        raise ValidationError("Reative o produto antes de criar uma reposição.")
+    quantity = product.suggested_replenishment if quantity in (None, "") else to_decimal(quantity)
+    if quantity <= 0 or quantity != quantity.to_integral_value():
+        raise ValidationError("A quantidade da reposição deve ser um número inteiro maior que zero.")
     demand = ProductionDemand.objects.create(
         company=product.company,
         code=Sequence.next(product.company, "REP"),
@@ -542,6 +548,71 @@ def create_replenishment(product, quantity=None, user=None):
         printer=None,
     )
     return demand
+
+
+@transaction.atomic
+def cancel_replenishment(demand, reason, user=None):
+    """Exclusão lógica segura, permitida somente para reposição sem efeitos consolidados."""
+    from .activity import log_event
+    demand = ProductionDemand.objects.select_for_update().get(pk=demand.pk)
+    if demand.origin != "replenishment":
+        raise ValidationError("Produções de pedidos de clientes não podem ser excluídas por este fluxo.")
+    if not demand.active or demand.cancelled_at:
+        return demand
+    if not reason.strip():
+        raise ValidationError("Informe o motivo da exclusão da reposição.")
+    material_effects = MaterialMovement.objects.filter(
+        company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk)
+    ).exists()
+    stock_effects = StockMovement.objects.filter(
+        company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk)
+    ).exists()
+    if demand.completed_stock_movement or demand.consumed_supplies or material_effects or stock_effects:
+        raise ValidationError("Esta reposição já gerou consumo ou entrada de estoque. Reabra/corrija a produção para gerar os estornos antes de excluí-la.")
+    release_demand_reservations(demand)
+    demand.active = False
+    demand.cancelled_at = timezone.now()
+    demand.cancelled_by = user
+    demand.notes = (demand.notes + "\n" if demand.notes else "") + f"Reposição excluída: {reason.strip()}"
+    demand.save(update_fields=["active", "cancelled_at", "cancelled_by", "reserved_supplies", "notes", "updated_at"])
+    Alert.objects.filter(company=demand.company, source_type="erp.ProductionDemand", source_id=str(demand.pk), resolved_at__isnull=True).update(resolved_at=timezone.now())
+    log_event(demand, "production.replenishment.cancelled", f"Reposição retirada da fila: {reason.strip()}", user,
+        key=f"replenishment:{demand.pk}:cancelled")
+    return demand
+
+
+@transaction.atomic
+def set_product_active(product, active, user=None):
+    """Inativa produto zerando cada localização por movimentos auditáveis."""
+    from .activity import log_event
+    product = product.__class__.objects.select_for_update().get(pk=product.pk)
+    if product.active == active:
+        return product
+    if not active:
+        if product.current_stock:
+            move_product_stock(product, -product.current_stock, "adjustment", user, product,
+                "Zeragem por inativação do produto")
+        for balance in ConsignmentBalance.objects.select_for_update().filter(company=product.company, product=product).exclude(quantity=0):
+            previous = balance.quantity
+            balance.quantity = Decimal("0")
+            balance.save(update_fields=["quantity", "updated_at"])
+            StockMovement.objects.create(
+                company=product.company, product=product, movement_type="adjustment", quantity=-previous,
+                balance_after=0, source_type="erp.Product", source_id=str(product.pk),
+                note="Zeragem por inativação do produto", location=f"Consignação · {balance.store.name}", user=user,
+            )
+        product.active = False
+        product.deactivated_at = timezone.now()
+        product.deactivated_by = user
+        product.save(update_fields=["active", "deactivated_at", "deactivated_by", "updated_at"])
+        log_event(product, "product.deactivated", "Produto inativado; saldos central e consignados zerados por movimentação", user)
+    else:
+        product.active = True
+        product.deactivated_at = None
+        product.deactivated_by = None
+        product.save(update_fields=["active", "deactivated_at", "deactivated_by", "updated_at"])
+        log_event(product, "product.reactivated", "Produto reativado com estoque inicial zero", user)
+    return product
 
 
 @transaction.atomic
@@ -617,12 +688,100 @@ def create_sale(company, customer, method, cart, account, key, user=None):
     return sale
 
 
+def default_financial_account(company):
+    return company.financialaccount_set.filter(active=True, is_default=True).first() or company.financialaccount_set.filter(active=True).first()
+
+
+def order_open_receivables(order):
+    return FinancialEntry.objects.filter(
+        company=order.company, active=True, direction="in", status="pending",
+        source_type="erp.Order", source_id=str(order.pk),
+    )
+
+
+@transaction.atomic
+def ensure_order_advance_receivable(order, user=None):
+    """Cria apenas a parcela antecipada ainda não coberta por recebimentos/títulos."""
+    from .activity import log_event
+    order = Order.objects.select_for_update().select_related("company", "customer").get(pk=order.pk)
+    company = order.company
+    if not company.require_order_advance or order.value <= 0 or order.calculation_status != "completed" or order.cancelled_at:
+        return None
+    target = money(order.value * company.order_advance_percent / Decimal("100"))
+    covered = min(order.received, target) + (order_open_receivables(order).aggregate(total=Sum("gross_amount"))["total"] or Decimal("0"))
+    amount = money(min(target, order.value) - covered)
+    if amount <= 0:
+        return None
+    entry = FinancialEntry.objects.create(
+        company=company, code=Sequence.next(company, "FIN"), direction="in",
+        description=f"Entrada antecipada do pedido {order.code}", category="Entrada antecipada de pedido",
+        account=None, customer=order.customer, gross_amount=amount, fee_amount=0, net_amount=amount,
+        issue_date=timezone.localdate(), due_date=timezone.localdate(), status="pending",
+        source_type="erp.Order", source_id=str(order.pk),
+        snapshot={"order": order.code, "purpose": "advance", "advance_percent": str(company.order_advance_percent)},
+    )
+    log_event(order, "order.receivable.advance", f"Título antecipado criado: {money(amount)}", user,
+        key=f"order:{order.pk}:receivable:advance:{entry.pk}")
+    return entry
+
+
+@transaction.atomic
+def ensure_order_final_receivable(order, completed_on=None, user=None):
+    """Gera exatamente o saldo não coberto ao pedido ficar pronto para entrega."""
+    from .activity import log_event
+    order = Order.objects.select_for_update().select_related("company", "customer").get(pk=order.pk)
+    if order.cancelled_at or order.value <= 0:
+        return None
+    received = order.received
+    open_total = order_open_receivables(order).aggregate(total=Sum("gross_amount"))["total"] or Decimal("0")
+    amount = money(order.value - received - open_total)
+    if amount <= 0:
+        if order.value - received <= 0:
+            log_event(order, "order.ready.paid", "Pedido finalizado — sem saldo pendente", user,
+                key=f"order:{order.pk}:ready:paid")
+        return None
+    issue_date = completed_on or timezone.localdate()
+    due_date = issue_date + timedelta(days=order.company.receivable_days_after_completion)
+    entry = FinancialEntry.objects.create(
+        company=order.company, code=Sequence.next(order.company, "FIN"), direction="in",
+        description=f"Saldo final do pedido {order.code}", category="Recebimento de pedidos",
+        account=None, customer=order.customer, gross_amount=amount, fee_amount=0, net_amount=amount,
+        issue_date=issue_date, due_date=due_date, status="pending", source_type="erp.Order", source_id=str(order.pk),
+        snapshot={"order": order.code, "purpose": "final", "completion_date": issue_date.isoformat(),
+                  "receivable_days": order.company.receivable_days_after_completion},
+    )
+    log_event(order, "order.receivable.final", f"Saldo a receber criado com vencimento em {due_date:%d/%m/%Y}", user,
+        key=f"order:{order.pk}:receivable:final:{entry.pk}")
+    return entry
+
+
+def _apply_receipt_to_open_titles(order, amount):
+    """Abate títulos automáticos sem apagá-los; títulos cobertos ficam cancelados como substituídos pelo recebimento."""
+    remaining = money(amount)
+    for title in order_open_receivables(order).select_for_update().order_by("due_date", "pk"):
+        if remaining <= 0:
+            break
+        if remaining >= title.gross_amount:
+            remaining -= title.gross_amount
+            title.status = "cancelled"
+            title.notes = (title.notes + "\n" if title.notes else "") + "Substituído pelo recebimento liquidado."
+            title.save(update_fields=["status", "notes", "updated_at"])
+        else:
+            title.gross_amount = money(title.gross_amount - remaining)
+            title.net_amount = title.gross_amount
+            title.notes = (title.notes + "\n" if title.notes else "") + f"Abatimento de {money(remaining)} por recebimento parcial."
+            title.save(update_fields=["gross_amount", "net_amount", "notes", "updated_at"])
+            remaining = Decimal("0")
+
+
 @transaction.atomic
 def record_order_payment(order, method, account, amount=None, key=None, received=True, notes=""):
     order = Order.objects.select_for_update().get(pk=order.pk)
     if order.cancelled_at:
         raise ValidationError("Pedido cancelado não pode receber pagamento.")
     validate_company(order.company, method, account)
+    if received and account is None:
+        raise ValidationError("Selecione a conta de destino do recebimento.")
     record, created = begin_once(order.company, key, "order_payment")
     if not created:
         return previous_result(record)
@@ -631,13 +790,15 @@ def record_order_payment(order, method, account, amount=None, key=None, received
         raise ValidationError("O recebimento deve ser maior que zero e não pode exceder o saldo.")
     fee = money(gross * method.fee_percent / Decimal("100"))
     net = money(gross - fee)
+    if received:
+        _apply_receipt_to_open_titles(order, gross)
     entry = FinancialEntry.objects.create(
         company=order.company,
         code=Sequence.next(order.company, "FIN"),
         direction="in",
         description=f"Recebimento do pedido {order.code}",
         category="Recebimento de pedidos",
-        account=account,
+        account=account if received else None,
         customer=order.customer,
         payment_method=method,
         gross_amount=money(gross),
@@ -673,6 +834,8 @@ def record_order_payment(order, method, account, amount=None, key=None, received
 @transaction.atomic
 def create_manual_entries(company, direction, description, category, amount, account, method, due_date, paid_now, installments=1, customer=None, supplier="", notes=""):
     validate_company(company, account, method, customer)
+    if paid_now and account is None:
+        raise ValidationError("Selecione a conta financeira para liquidar o lançamento.")
     total = money(to_decimal(amount))
     installments = max(1, int(installments or 1))
     base = money(total / installments)
@@ -689,7 +852,7 @@ def create_manual_entries(company, direction, description, category, amount, acc
             direction=direction,
             description=description,
             category=category,
-            account=account,
+            account=account if paid_now else account,
             customer=customer,
             supplier=supplier,
             payment_method=method,
@@ -709,16 +872,36 @@ def create_manual_entries(company, direction, description, category, amount, acc
 
 
 @transaction.atomic
-def settle_financial_entry(entry):
+def settle_financial_entry(entry, account=None, method=None, user=None):
     entry = FinancialEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.status == "cancelled":
         raise ValidationError("Lançamento cancelado não pode ser liquidado.")
     if entry.status == "paid":
         return entry
+    account = account or entry.account or default_financial_account(entry.company)
+    if account is None or not account.active:
+        raise ValidationError("Selecione uma conta financeira ativa para liquidar o lançamento.")
+    validate_company(entry.company, account, method)
+    entry.account = account
+    if method is not None:
+        entry.payment_method = method
     entry.status = "paid"
     entry.paid_at = timezone.now()
-    entry.save(update_fields=["status", "paid_at", "updated_at"])
+    entry.save(update_fields=["account", "payment_method", "status", "paid_at", "updated_at"])
     payment = Payment.objects.filter(financial_entry=entry).select_related("order").first()
+    if not payment and entry.direction == "in" and entry.customer_id and entry.source_type == "erp.Order" and str(entry.source_id).isdigit():
+        order = Order.objects.filter(pk=entry.source_id, company=entry.company).first()
+        method = entry.payment_method or entry.company.paymentmethod_set.filter(active=True).first()
+        if order and method:
+            fee = money(entry.gross_amount * method.fee_percent / Decimal("100"))
+            entry.fee_amount = fee
+            entry.net_amount = money(entry.gross_amount - fee)
+            entry.save(update_fields=["fee_amount", "net_amount", "updated_at"])
+            payment = Payment.objects.create(
+                company=entry.company, order=order, customer=entry.customer, financial_entry=entry, method=method,
+                gross_amount=entry.gross_amount, fee_amount=fee, net_amount=entry.net_amount, status="received",
+                snapshot={**entry.snapshot, "settled_from_title": True},
+            )
     if payment:
         payment.status = "received"
         payment.save(update_fields=["status", "updated_at"])
@@ -753,12 +936,14 @@ def close_roll(filament, user=None):
 
 
 @transaction.atomic
-def complete_purchase(purchase, account, user=None):
+def complete_purchase(purchase, account=None, user=None):
     purchase = Purchase.objects.select_for_update().prefetch_related("items__filament__family", "items__supply").get(pk=purchase.pk)
     if purchase.cancelled_at:
         raise ValidationError("Compra cancelada não pode ser confirmada.")
     if purchase.completed_at:
         return purchase
+    # A efetivação cria contas a pagar pendentes. A conta financeira só é
+    # obrigatória quando a obrigação for de fato liquidada.
     validate_company(purchase.company, account)
     total = Decimal("0")
     for item in purchase.items.all():
@@ -789,7 +974,8 @@ def complete_purchase(purchase, account, user=None):
     purchase.total = money(total)
     purchase.account = account
     purchase.completed_at = timezone.now()
-    purchase.save(update_fields=["total", "account", "completed_at", "updated_at"])
+    purchase.status = "effected"
+    purchase.save(update_fields=["total", "account", "completed_at", "status", "updated_at"])
     entries = create_manual_entries(
         purchase.company,
         "out",

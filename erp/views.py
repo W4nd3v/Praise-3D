@@ -74,6 +74,7 @@ from .services import (
     complete_purchase,
     complete_settlement,
     complete_shipment,
+    cancel_replenishment,
     correct_purchase,
     create_manual_entries,
     create_replenishment,
@@ -87,6 +88,7 @@ from .services import (
     request_to_quote,
     register_production_failure,
     settle_financial_entry,
+    set_product_active,
     to_decimal,
 )
 
@@ -143,6 +145,7 @@ def common_context(company):
         "customers": Customer.objects.filter(company=company, active=True),
         "payment_methods": PaymentMethod.objects.filter(company=company, active=True),
         "accounts": FinancialAccount.objects.filter(company=company, active=True),
+        "default_account": FinancialAccount.objects.filter(company=company, active=True, is_default=True).first(),
         "printers": Printer.objects.filter(company=company, active=True),
         "families": MaterialFamily.objects.filter(company=company, active=True),
         "supplies": Supply.objects.filter(company=company, active=True),
@@ -163,8 +166,10 @@ def dashboard(request):
     company = request.company
     refresh_due(company)
     demands = operating_demands(company)
-    products_low = Product.objects.filter(company=company, active=True, current_stock__lte=F("minimum_stock"))
-    filaments_low = Filament.objects.filter(company=company, active=True).filter(Q(minimum_rolls__isnull=False, closed_rolls__lte=F("minimum_rolls")) | Q(minimum_rolls__isnull=True, closed_rolls__lte=company.default_filament_minimum))
+    products_low = Product.objects.filter(company=company, active=True, operational_activity=True, current_stock__lte=F("minimum_stock"))
+    filaments_low = list(Filament.objects.filter(company=company, active=True).filter(Q(minimum_rolls__isnull=False, closed_rolls__lte=F("minimum_rolls")) | Q(minimum_rolls__isnull=True, closed_rolls__lte=company.default_filament_minimum))[:6])
+    for filament in filaments_low:
+        filament.purchase_suggestion = max(0, filament.effective_minimum - filament.closed_rolls)
     context = {
         "title": "Início",
         "today": timezone.localdate(),
@@ -176,7 +181,7 @@ def dashboard(request):
             ("Aguardando impressão", demands.filter(stage="queue").count(), "production", "blue"),
             ("Imprimindo", demands.filter(stage="printing").count(), "production", "green"),
             ("Entregas pendentes", demands.filter(stage="ready", order__delivered_at__isnull=True).count(), "orders", "orange"),
-            ("Estoques abaixo do mínimo", products_low.count() + filaments_low.count(), "stock", "red"),
+            ("Estoques abaixo do mínimo", products_low.count() + len(filaments_low), "stock", "red"),
             ("Cálculos pendentes", Order.objects.filter(company=company, active=True, calculation_status="pending").count(), "orders", "violet"),
         ],
         "demands": sort_demands(list(demands.exclude(stage="ready")))[:10],
@@ -186,6 +191,8 @@ def dashboard(request):
         "alerts": Alert.objects.filter(company=company, active=True, resolved_at__isnull=True)[:6],
         "products_low": products_low[:4],
         "filaments_low": filaments_low[:4],
+        "supplies_low": [item for item in Supply.objects.filter(company=company, active=True) if item.available_stock <= item.minimum_stock][:6],
+        "pending_purchases": Purchase.objects.filter(company=company, active=True, status__in=["draft", "pending"]).select_related("payment_method").prefetch_related("items")[:8],
     }
     context.update(dashboard_operations(company, list(visible_reminders(request).filter(status="due"))))
     context["cards"][6] = ("Entregas pendentes", len(context["ready_orders"]), "orders", "orange")
@@ -368,9 +375,10 @@ def orders_page(request):
 def order_payment(request, pk):
     order = get_object_or_404(Order, pk=pk, company=request.company, active=True)
     method = get_object_or_404(PaymentMethod, pk=request.POST.get("payment_method"), company=request.company, active=True)
-    account = get_object_or_404(FinancialAccount, pk=request.POST.get("account"), company=request.company, active=True)
+    received_now = request.POST.get("received_now") == "on"
+    account = optional_company_record(FinancialAccount, request.POST.get("account"), request.company, active=True)
     try:
-        record_order_payment(order, method, account, request.POST.get("amount") or None, request.POST.get("idempotency_key"), request.POST.get("received_now") == "on", request.POST.get("notes", ""))
+        record_order_payment(order, method, account, request.POST.get("amount") or None, request.POST.get("idempotency_key"), received_now, request.POST.get("notes", ""))
         messages.success(request, "Recebimento registrado.")
     except ValidationError as exc:
         messages.error(request, "; ".join(exc.messages))
@@ -382,16 +390,25 @@ def order_payment(request, pk):
 @transaction.atomic
 def deliver_order(request, pk):
     order = get_object_or_404(Order.objects.select_for_update(), pk=pk, company=request.company, active=True)
+    error = ""
     if order.cancelled_at:
-        messages.error(request, "Pedido cancelado não pode ser entregue.")
+        error = "Pedido cancelado não pode ser entregue."
+        messages.error(request, error)
     elif not order.demands.filter(active=True).exists() or order.demands.filter(active=True).exclude(stage="ready").exists():
-        messages.error(request, "O pedido precisa estar pronto antes da entrega.")
+        error = "O pedido precisa estar pronto antes da entrega."
+        messages.error(request, error)
     elif order.delivered_at:
         messages.info(request, "Entrega já registrada.")
     else:
         order.delivered_at = timezone.now()
         order.save(update_fields=["delivered_at", "updated_at"])
+        from .activity import log_event
+        log_event(order, "order.delivered", f"Entrega do pedido {order.code} registrada", request.user,
+            key=f"order:{order.pk}:delivered")
         messages.success(request, "Entrega registrada.")
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        order.refresh_from_db()
+        return JsonResponse({"ok": bool(order.delivered_at), "error": error, "redirect": f"/pedidos/{pk}/"}, status=400 if error else 200)
     return redirect(f"/pedidos/?selected={pk}")
 
 
@@ -415,6 +432,18 @@ def production_advance(request, pk):
     except ValidationError as exc:
         messages.error(request, "; ".join(exc.messages))
     return redirect(f"/producao/?selected={pk}")
+
+
+@require_POST
+@company_required
+def production_cancel_replenishment(request, pk):
+    demand = get_object_or_404(ProductionDemand, pk=pk, company=request.company)
+    try:
+        cancel_replenishment(demand, request.POST.get("reason", ""), request.user)
+        messages.success(request, "Reposição excluída da fila; reservas liberadas e histórico preservado.")
+    except ValidationError as exc:
+        messages.error(request, "; ".join(exc.messages))
+    return redirect("production")
 
 
 @require_POST
@@ -445,7 +474,7 @@ def catalog_page(request):
         try:
             category = optional_company_record(ProductCategory, request.POST.get("category"), company, active=True)
             product_type = optional_company_record(ProductType, request.POST.get("product_type"), company, active=True)
-            product = optional_company_record(Product, request.POST.get("product_id"), company, active=True)
+            product = optional_company_record(Product, request.POST.get("product_id"), company)
             if product is not None:
                 sku = request.POST.get("sku", "").strip() or product.sku
                 if Product.objects.filter(company=company, sku=sku).exclude(pk=product.pk).exists():
@@ -460,9 +489,14 @@ def catalog_page(request):
                 product.target_stock = to_decimal(request.POST.get("target_stock"))
                 product.current_cost = to_decimal(request.POST.get("current_cost"), product.current_cost)
                 product.current_price = to_decimal(request.POST.get("current_price"), product.current_price)
+                if "product_flags_present" in request.POST:
+                    product.operational_activity = bool(request.POST.get("operational_activity"))
                 if request.FILES.get("image"):
                     product.image = request.FILES["image"]
+                desired_active = bool(request.POST.get("active")) if "active" in request.POST else product.active
                 product.save()
+                if desired_active != product.active:
+                    set_product_active(product, desired_active, request.user)
                 messages.success(request, f"Produto {product.name} atualizado.")
                 return redirect("catalog")
             model = CalculationModel.objects.filter(company=company, active=True, default=True).first()
@@ -481,6 +515,8 @@ def catalog_page(request):
                 description=request.POST.get("description", ""), image=request.FILES.get("image"), composition=composition,
                 minimum_stock=to_decimal(request.POST.get("minimum_stock")), target_stock=to_decimal(request.POST.get("target_stock")), current_stock=0,
                 current_cost=to_decimal(request.POST.get("current_cost")), current_price=to_decimal(request.POST.get("current_price")),
+                operational_activity=bool(request.POST.get("operational_activity")) if "product_flags_present" in request.POST else True,
+                active=bool(request.POST.get("active")) if "product_flags_present" in request.POST else True,
             )
             messages.success(request, f"Produto {product.name} criado com SKU {product.sku}. Complete a composição para precificá-lo.")
             return redirect("composition", pk=composition.pk)
@@ -489,7 +525,8 @@ def catalog_page(request):
             transaction.set_rollback(True)
             return redirect("catalog")
     from .operations import visible_records
-    products = visible_records(Product, company).filter(active=True).select_related("composition", "category_ref", "product_type").order_by("category_ref__name", "name")
+    show_inactive = request.GET.get("inactive") == "1"
+    products = visible_records(Product, company).filter(active=not show_inactive).select_related("composition", "category_ref", "product_type", "deactivated_by").annotate(consigned_quantity=Sum("consignment_balances__quantity")).order_by("category_ref__name", "name")
     if request.GET.get("category"):
         products = products.filter(category_ref_id=request.GET.get("category"))
     if request.GET.get("type"):
@@ -502,7 +539,7 @@ def catalog_page(request):
     while Product.objects.filter(company=company, sku=str(next_value).zfill(4)).exists():
         next_value += 1
     groups = [{"grouper":category, "list":list(items)} for category,items in groupby(products, key=lambda product: product.display_category)] if request.GET.get("group", "1") == "1" else [{"grouper":"Todos os produtos", "list":products.order_by("name")}]
-    context.update({"title": "Catálogo", "catalog_products": products, "catalog_groups":groups, "suggested_sku":str(next_value).zfill(4)})
+    context.update({"title": "Produtos inativados" if show_inactive else "Catálogo", "catalog_products": products, "catalog_groups":groups, "suggested_sku":str(next_value).zfill(4), "show_inactive": show_inactive})
     return render(request, "erp/catalog.html", context)
 
 
@@ -543,7 +580,7 @@ def stock_page(request):
         "title": "Estoque",
         "stock_products": stock_products,
         "movements": StockMovement.objects.filter(company=company, active=True).select_related("product", "user")[:30],
-        "low_products": products.filter(current_stock__lte=F("minimum_stock")),
+        "low_products": products.filter(operational_activity=True, current_stock__lte=F("minimum_stock")),
         "replenishments": ProductionDemand.objects.filter(company=company, active=True, origin="replenishment").exclude(stage="ready")[:10],
     })
     return render(request, "erp/stock.html", context)
@@ -640,31 +677,57 @@ def materials_page(request):
                 if not created:
                     return redirect("materials")
                 method = get_object_or_404(PaymentMethod, pk=request.POST.get("payment_method"), company=company, active=True)
-                account = get_object_or_404(FinancialAccount, pk=request.POST.get("account"), company=company, active=True)
-                quantity = to_decimal(request.POST.get("quantity"))
-                unit_cost = to_decimal(request.POST.get("unit_cost"))
-                material_class = Filament if request.POST.get("material_type") == "filament" else Supply
-                material = get_object_or_404(material_class, pk=request.POST.get("material_id"), company=company, active=True)
-                if quantity <= 0 or unit_cost < 0 or (material_class is Filament and quantity != quantity.to_integral_value()):
-                    raise ValidationError("Informe quantidade positiva (rolos inteiros) e custo não negativo.")
+                account = optional_company_record(FinancialAccount, request.POST.get("account"), company, active=True)
+                material_type = request.POST.get("material_type")
+                if material_type not in {"filament", "supply"}:
+                    raise ValidationError("Selecione o tipo da compra.")
+                material_class = Filament if material_type == "filament" else Supply
+                ids = request.POST.getlist("material_id")
+                quantities = request.POST.getlist("quantity")
+                unit_costs = request.POST.getlist("unit_cost")
+                line_totals = request.POST.getlist("line_total")
+                if not ids or not (len(ids) == len(quantities) == len(unit_costs) == len(line_totals)):
+                    raise ValidationError("Adicione e confira os itens da compra.")
+                supplier = request.POST.get("supplier", "").strip()
+                if not supplier:
+                    raise ValidationError("Informe o fornecedor da compra.")
+                installments = int(request.POST.get("installments") or 1)
+                if not 1 <= installments <= 120:
+                    raise ValidationError("Parcelas devem estar entre 1 e 120.")
                 purchase = Purchase.objects.create(
-                    company=company, code=Sequence.next(company, "COM"), supplier=request.POST.get("supplier"),
+                    company=company, code=Sequence.next(company, "COM"), supplier=supplier,
                     purchase_date=parse_date(request.POST.get("purchase_date")), payment_method=method, account=account,
-                    installments=int(request.POST.get("installments") or 1), first_due_date=parse_date(request.POST.get("first_due_date")),
-                    total=money(quantity * unit_cost), notes=request.POST.get("notes", ""),
+                    installments=installments, first_due_date=parse_date(request.POST.get("first_due_date")),
+                    total=0, notes=request.POST.get("notes", ""), purchase_type=material_type,
+                    status="pending" if request.POST.get("save_status") == "pending" else "draft",
                 )
-                kwargs = {"filament_id": request.POST.get("material_id")} if request.POST.get("material_type") == "filament" else {"supply_id": request.POST.get("material_id")}
-                PurchaseItem.objects.create(company=company, purchase=purchase, quantity=quantity, unit_cost=unit_cost, total=money(quantity * unit_cost), **kwargs)
+                total = Decimal("0")
+                seen = set()
+                for ident, raw_quantity, raw_unit, raw_total in zip(ids, quantities, unit_costs, line_totals):
+                    if ident in seen:
+                        raise ValidationError("O mesmo material não deve aparecer duas vezes na compra.")
+                    seen.add(ident)
+                    material = get_object_or_404(material_class, pk=ident, company=company, active=True)
+                    quantity, unit_cost, line_total = to_decimal(raw_quantity), to_decimal(raw_unit), to_decimal(raw_total)
+                    if not quantity.is_finite() or quantity <= 0 or (material_type == "filament" and quantity != quantity.to_integral_value()):
+                        raise ValidationError("Informe quantidades positivas; filamentos usam rolos inteiros.")
+                    if not unit_cost.is_finite() or not line_total.is_finite() or unit_cost < 0 or line_total < 0:
+                        raise ValidationError("Valores da compra não podem ser negativos.")
+                    line_total = money(line_total)
+                    unit_cost = money(line_total / quantity)
+                    kwargs = {"filament": material} if material_type == "filament" else {"supply": material}
+                    PurchaseItem.objects.create(company=company, purchase=purchase, quantity=quantity, unit_cost=unit_cost, total=line_total, **kwargs)
+                    total += line_total
+                purchase.total = money(total)
+                purchase.save(update_fields=["total", "updated_at"])
                 finish_once(operation, purchase)
                 if request.POST.get("confirm"):
                     complete_purchase(purchase, account, request.user)
                     messages.success(request, f"Compra {purchase.code} concluída: estoque e financeiro atualizados.")
                 else:
-                    messages.success(request, f"Compra {purchase.code} salva como rascunho.")
+                    messages.success(request, f"Compra {purchase.code} salva como {purchase.get_status_display().lower()} sem movimentar estoque ou financeiro.")
             elif action == "purchase_confirm":
                 purchase = get_object_or_404(Purchase, pk=request.POST.get("purchase_id"), company=company, active=True)
-                if not purchase.account:
-                    raise ValidationError("Selecione uma conta antes de confirmar a compra.")
                 complete_purchase(purchase, purchase.account, request.user)
                 messages.success(request, f"Compra {purchase.code} confirmada.")
             elif action == "purchase_correct":
@@ -673,7 +736,7 @@ def materials_page(request):
                     purchase.supplier = request.POST.get("supplier", "").strip()
                     purchase.purchase_date = parse_date(request.POST.get("purchase_date"), purchase.purchase_date)
                     purchase.payment_method = get_object_or_404(PaymentMethod, pk=request.POST.get("payment_method"), company=company, active=True)
-                    purchase.account = get_object_or_404(FinancialAccount, pk=request.POST.get("account"), company=company, active=True)
+                    purchase.account = optional_company_record(FinancialAccount, request.POST.get("account"), company, active=True)
                     purchase.installments = max(1, int(request.POST.get("installments") or 1))
                     purchase.first_due_date = parse_date(request.POST.get("first_due_date"), purchase.first_due_date)
                     purchase.save()
@@ -776,7 +839,7 @@ def pos_page(request):
         try:
             customer = get_object_or_404(Customer, pk=request.POST.get("customer"), company=company, active=True)
             method = get_object_or_404(PaymentMethod, pk=request.POST.get("payment_method"), company=company, active=True)
-            account = get_object_or_404(FinancialAccount, pk=request.POST.get("account"), company=company, active=True)
+            account = optional_company_record(FinancialAccount, request.POST.get("account"), company, active=True)
             raw_cart = json.loads(request.POST.get("cart", "[]"))
             cart = []
             for row in raw_cart:
@@ -805,6 +868,12 @@ def consignment_page(request):
                 store.contact_name = request.POST.get("contact_name", "")
                 store.phone = request.POST.get("phone", "")
                 store.address = request.POST.get("address", "")
+                store.city = request.POST.get("city", "").strip()
+                store.state = request.POST.get("state", "").strip().upper()
+                store.postal_code = request.POST.get("postal_code", "").strip()
+                store.district = request.POST.get("district", "").strip()
+                store.street_number = request.POST.get("street_number", "").strip()
+                store.complement = request.POST.get("complement", "").strip()
                 store.notes = request.POST.get("notes", "")
                 store.default_commission_percent = to_decimal(request.POST.get("commission"))
                 if not store.name or not 0 <= store.default_commission_percent <= 100:
@@ -853,6 +922,41 @@ def consignment_page(request):
     from .models import ArchivedRecord
     context["shipments"] = context["shipments"].exclude(pk__in=ArchivedRecord.objects.filter(company=company, source_model="erp.ConsignmentShipment", archived=True).values("source_id"))
     return render(request, "erp/consignment.html", context)
+
+
+@company_required
+@transaction.atomic
+def consignment_stores(request):
+    company = request.company
+    if request.method == "POST":
+        try:
+            store = optional_company_record(ConsignedStore, request.POST.get("store_id"), company) or ConsignedStore(company=company)
+            store.name = request.POST.get("name", "").strip()
+            store.contact_name = request.POST.get("contact_name", "").strip()
+            store.phone = request.POST.get("phone", "").strip()
+            store.address = request.POST.get("address", "").strip()
+            store.city = request.POST.get("city", "").strip()
+            store.state = request.POST.get("state", "").strip().upper()
+            store.postal_code = request.POST.get("postal_code", "").strip()
+            store.district = request.POST.get("district", "").strip()
+            store.street_number = request.POST.get("street_number", "").strip()
+            store.complement = request.POST.get("complement", "").strip()
+            store.notes = request.POST.get("notes", "").strip()
+            store.default_commission_percent = to_decimal(request.POST.get("commission"))
+            if not store.name or len(store.state) not in {0, 2} or not 0 <= store.default_commission_percent <= 100:
+                raise ValidationError("Informe nome, UF com 2 letras e comissão entre 0% e 100%.")
+            store.save()
+            messages.success(request, "Loja consignada salva.")
+        except (ValidationError, ValueError) as exc:
+            messages.error(request, "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc))
+            transaction.set_rollback(True)
+        return redirect("consignment_stores")
+    stores = ConsignedStore.objects.filter(company=company)
+    if request.GET.get("status") in {"active", "inactive"}:
+        stores = stores.filter(active=request.GET["status"] == "active")
+    if request.GET.get("q"):
+        stores = stores.filter(Q(name__icontains=request.GET["q"]) | Q(city__icontains=request.GET["q"]) | Q(contact_name__icontains=request.GET["q"]))
+    return render(request, "erp/consignment_stores.html", {"title": "Lojas consignadas", "stores": stores})
 
 
 @company_required
@@ -955,7 +1059,7 @@ def finance_page(request):
     if request.method == "POST":
         try:
             direction = request.POST.get("direction")
-            account = get_object_or_404(FinancialAccount, pk=request.POST.get("account"), company=company, active=True)
+            account = optional_company_record(FinancialAccount, request.POST.get("account"), company, active=True)
             method = optional_company_record(PaymentMethod, request.POST.get("payment_method"), company, active=True)
             customer = optional_company_record(Customer, request.POST.get("customer"), company, active=True)
             created = create_manual_entries(
@@ -974,8 +1078,12 @@ def finance_page(request):
     filtered = entries
     if request.GET.get("entry", "").isdigit(): filtered = filtered.filter(pk=request.GET["entry"])
     if request.GET.get("customer", "").isdigit(): filtered = filtered.filter(customer_id=request.GET["customer"])
+    if request.GET.get("account", "").isdigit(): filtered = filtered.filter(account_id=request.GET["account"])
+    if request.GET.get("direction") in {"in", "out"}: filtered = filtered.filter(direction=request.GET["direction"])
     if request.GET.get("overdue"): filtered = filtered.filter(status="pending", due_date__lt=timezone.localdate())
     if request.GET.get("status"): filtered = filtered.filter(status=request.GET["status"])
+    if request.GET.get("start"): filtered = filtered.filter(issue_date__gte=parse_date(request.GET["start"]))
+    if request.GET.get("end"): filtered = filtered.filter(issue_date__lte=parse_date(request.GET["end"]))
     if request.GET.get("q"): filtered = filtered.filter(Q(code__icontains=request.GET["q"]) | Q(description__icontains=request.GET["q"]) | Q(customer__name__icontains=request.GET["q"]))
     from .operations import record_url
     shown = list(filtered[:200])
@@ -997,7 +1105,9 @@ def finance_page(request):
 def finance_settle(request, pk):
     entry = get_object_or_404(FinancialEntry, pk=pk, company=request.company, active=True)
     try:
-        settle_financial_entry(entry)
+        account = optional_company_record(FinancialAccount, request.POST.get("account"), request.company, active=True)
+        method = optional_company_record(PaymentMethod, request.POST.get("payment_method"), request.company, active=True)
+        settle_financial_entry(entry, account, method, request.user)
         messages.success(request, "Lançamento liquidado.")
     except ValidationError as exc:
         messages.error(request, "; ".join(exc.messages))
@@ -1044,8 +1154,16 @@ def settings_page(request):
                     if field in request.POST:
                         setattr(company, field, request.POST.get(field))
                 for field in ["energy_rate", "labor_hour_rate", "fixed_cost_per_order", "waste_percent", "default_margin_percent"]:
-                    setattr(company, field, to_decimal(request.POST.get(field)))
-                company.default_filament_minimum = int(request.POST.get("default_filament_minimum") or 2)
+                    if field in request.POST:
+                        setattr(company, field, to_decimal(request.POST.get(field)))
+                if "default_filament_minimum" in request.POST:
+                    company.default_filament_minimum = int(request.POST.get("default_filament_minimum") or 2)
+                if "receivable_days_after_completion" in request.POST:
+                    company.receivable_days_after_completion = max(0, int(request.POST.get("receivable_days_after_completion") or 0))
+                    company.require_order_advance = bool(request.POST.get("require_order_advance"))
+                    company.order_advance_percent = to_decimal(request.POST.get("order_advance_percent"))
+                    if company.require_order_advance and not 0 < company.order_advance_percent <= 100:
+                        raise ValidationError("O pagamento antecipado deve ser maior que 0% e no máximo 100%.")
                 if request.FILES.get("logo"):
                     company.logo = request.FILES["logo"]
                 company.save()
@@ -1078,6 +1196,24 @@ def settings_page(request):
                 payment.days_to_receive = int(request.POST.get("days") or 0)
                 payment.save()
                 messages.success(request, "Forma de pagamento salva.")
+            elif action == "financial_account":
+                account = optional_company_record(FinancialAccount, request.POST.get("account_id"), company) or FinancialAccount(company=company)
+                account.name = request.POST.get("name", "").strip()
+                account.kind = request.POST.get("kind", "other")
+                account.institution = request.POST.get("institution", "").strip()
+                account.description = request.POST.get("description", "").strip()
+                account.opening_balance = to_decimal(request.POST.get("opening_balance"))
+                account.active = bool(request.POST.get("active"))
+                if not account.name or account.kind not in dict(FinancialAccount.KINDS):
+                    raise ValidationError("Informe nome e tipo válidos para a conta.")
+                account.is_default = bool(request.POST.get("is_default"))
+                if account.is_default:
+                    FinancialAccount.objects.filter(company=company).exclude(pk=account.pk).update(is_default=False)
+                    account.active = True
+                elif not account.pk:
+                    account.is_default = not FinancialAccount.objects.filter(company=company, active=True).exists()
+                account.save()
+                messages.success(request, "Conta financeira salva.")
             elif action == "calculation":
                 rules = {}
                 for component in ["material", "labor", "energy", "maintenance", "depreciation", "supplies", "waste"]:
@@ -1130,6 +1266,7 @@ def settings_page(request):
         "all_printers": Printer.objects.filter(company=company),
         "all_families": MaterialFamily.objects.filter(company=company),
         "all_payments": PaymentMethod.objects.filter(company=company),
+        "all_accounts": FinancialAccount.objects.filter(company=company),
         "all_categories": ProductCategory.objects.filter(company=company),
         "all_product_types": ProductType.objects.filter(company=company),
     })
@@ -1152,8 +1289,8 @@ def composition_page(request, pk):
                     raise ValidationError("A quantidade deve ser maior que zero.")
             if action in {"item", "item_update", "part"} and not request.POST.get("name", "").strip():
                 raise ValidationError("Informe o nome.")
-            if action == "part" and (to_decimal(request.POST.get("grams")) < 0 or int(request.POST.get("print_minutes") or 0) < 0):
-                raise ValidationError("Peso e tempo não podem ser negativos.")
+            if action == "part" and (to_decimal(request.POST.get("grams")) < 0 or int(request.POST.get("print_minutes") or 0) < 0 or int(request.POST.get("plate_quantity") or 1) < 1):
+                raise ValidationError("Peso e tempo não podem ser negativos; Qnt. na mesa deve ser ao menos 1.")
             if action == "meta" and (int(request.POST.get("labor_minutes") or 0) < 0 or not 0 <= to_decimal(request.POST.get("discount")) <= 100):
                 raise ValidationError("Mão de obra deve ser positiva e desconto deve estar entre 0% e 100%.")
             if action == "meta":
@@ -1188,7 +1325,7 @@ def composition_page(request, pk):
                 source = get_object_or_404(CompositionItem.objects.prefetch_related("parts", "supplies"), pk=request.POST.get("item"), company=request.company, composition=composition, active=True)
                 duplicate = CompositionItem.objects.create(company=request.company, composition=composition, name=f"{source.name} (cópia)", description=source.description, quantity=source.quantity, unit=source.unit)
                 for part in source.parts.filter(active=True):
-                    ManufacturingPart.objects.create(company=request.company, item=duplicate, name=part.name, material_family=part.material_family, grams=part.grams, print_minutes=part.print_minutes, printer=part.printer, quantity=part.quantity)
+                    ManufacturingPart.objects.create(company=request.company, item=duplicate, name=part.name, material_family=part.material_family, grams=part.grams, print_minutes=part.print_minutes, printer=part.printer, quantity=part.quantity, plate_quantity=part.plate_quantity)
                 for use in source.supplies.filter(active=True):
                     CompositionSupply.objects.create(company=request.company, item=duplicate, supply=use.supply, quantity=use.quantity)
                 composition.calculated_at = None
@@ -1213,6 +1350,9 @@ def composition_page(request, pk):
                 part.print_minutes = int(request.POST.get("print_minutes") or 0)
                 part.printer = printer
                 part.quantity = to_decimal(request.POST.get("quantity"), "1")
+                part.plate_quantity = int(request.POST.get("plate_quantity") or 1)
+                if part.plate_quantity < 1:
+                    raise ValidationError("Qnt. na mesa deve ser um número inteiro maior ou igual a 1.")
                 part.save()
                 composition.calculated_at = None
                 composition.save(update_fields=["calculated_at", "updated_at"])

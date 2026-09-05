@@ -113,7 +113,34 @@ def sort_demands(demands, sort="smart"):
 
 
 def action(label, url, record=None, category="", urgent=False):
-    return {"label": label, "url": url, "record": record, "category": category, "urgent": urgent}
+    customer = ""
+    description = ""
+    deadline = None
+    state = ""
+    if isinstance(record, m.Order):
+        customer, description, deadline = record.customer.name, record.description, record.deadline
+        state = order_state(record)["label"]
+    elif isinstance(record, m.ProductionDemand):
+        customer = record.order.customer.name if record.order_id else "Estoque central"
+        description, deadline, state = record.item_name, record.deadline, record.get_stage_display()
+    elif isinstance(record, (m.Quote, m.QuoteRequest)):
+        customer = record.customer.name
+        description = record.request.description if isinstance(record, m.Quote) else record.description
+        state = record.get_status_display()
+    elif isinstance(record, m.FinancialEntry):
+        customer = record.customer.name if record.customer_id else record.supplier
+        description, deadline, state = record.description, record.due_date, record.get_status_display()
+    elif isinstance(record, m.RequestReminder):
+        customer, description = record.request.customer.name, record.request.description
+        deadline, state = record.scheduled_at, record.get_status_display()
+    else:
+        description = getattr(record, "name", "") or str(record or "")
+        state = "Pendente"
+    due_date = deadline.date() if hasattr(deadline, "date") else deadline
+    overdue = bool(due_date and due_date < timezone.localdate())
+    return {"label": label, "url": url, "record": record, "category": category, "urgent": urgent,
+        "customer": customer or "—", "description": description, "deadline": deadline,
+        "state": state, "overdue": overdue, "code": getattr(record, "code", "") or getattr(record, "pk", "")}
 
 
 def next_order_action(order):
@@ -190,6 +217,8 @@ def dashboard_operations(company, reminders):
     for q in visible_records(m.Quote, company).filter(active=True, status__in=["draft", "approved"])[:5]:
         actions.append(action("Converter em pedido" if q.status == "approved" else "Enviar ao cliente", record_url("erp.Quote", q.pk), q, "Orçamento"))
     from django.db.models import F
-    for p in m.Product.objects.filter(company=company, active=True, current_stock__lte=F("minimum_stock"))[:5]:
+    for p in m.Product.objects.filter(company=company, active=True, operational_activity=True, current_stock__lte=F("minimum_stock"))[:5]:
         actions.append(action("Criar reposição", record_url("erp.Product", p.pk), p, "Estoque"))
-    return {"pending_categories": pending, "next_actions": actions[:30], "ready_orders": ready}
+    far = timezone.localdate().replace(year=9999, month=12, day=31)
+    actions.sort(key=lambda row: (not row["overdue"], not row["urgent"], (row["deadline"].date() if hasattr(row["deadline"], "date") else row["deadline"]) or far, getattr(row["record"], "created_at", timezone.now())))
+    return {"pending_categories": pending, "next_actions": actions[:12], "ready_orders": ready}

@@ -1,11 +1,12 @@
 """Encerramentos auditáveis: nunca apagam movimentos ou recebimentos antigos."""
 from decimal import Decimal
 from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.utils import timezone
 from . import models as m
 from .activity import log_event
-from .services import move_product_stock, release_demand_reservations
+from .services import move_product_stock, release_demand_reservations, set_product_active
 
 
 def reverse_entry(entry, reason, user=None):
@@ -66,6 +67,7 @@ def cancel_record(obj, reason, user=None):
                 m.MaterialMovement.objects.create(company=obj.company, filament=item.filament, supply=item.supply, quantity=-item.quantity,
                     movement_type="adjustment", source_type="erp.Purchase", source_id=str(obj.pk), user=user, note=f"Cancelamento {obj.code}: {reason}"[:220])
         entries = m.FinancialEntry.objects.filter(company=obj.company, source_type__in=["erp.Purchase", "erp.PurchaseCorrection"], source_id=str(obj.pk))
+        obj.status = "cancelled"
     elif isinstance(obj, m.ConsignmentShipment):
         if obj.completed_at:
             if obj.store.settlements.filter(status="completed", completed_at__gte=obj.completed_at).exists():
@@ -98,15 +100,72 @@ def cancel_record(obj, reason, user=None):
 @transaction.atomic
 def set_record_active(obj, active, user=None):
     obj = type(obj).objects.select_for_update().get(pk=obj.pk)
+    if isinstance(obj, m.Product):
+        return set_product_active(obj, active, user)
     if not active:
         if isinstance(obj, m.Customer) and obj.orders.filter(cancelled_at__isnull=True, delivered_at__isnull=True).exists():
             raise ValidationError("Cliente com pedidos abertos: encerre-os antes de inativar.")
         if isinstance(obj, m.ConsignedStore) and obj.balances.filter(quantity__gt=0).exists():
             raise ValidationError("A loja ainda possui produtos consignados.")
         if isinstance(obj, m.Supply) and obj.reserved_stock > 0: raise ValidationError("Insumo com reservas de produção.")
+        if isinstance(obj, m.FinancialAccount) and obj.is_default:
+            raise ValidationError("Defina outra conta padrão antes de inativar esta conta.")
     obj.active = active
     obj.save(update_fields=["active", "updated_at"])
     log_event(obj, "record.active", "Cadastro reativado" if active else "Cadastro inativado", user)
+
+
+def _has_operational_dependencies(obj):
+    """Considera qualquer vínculo reverso, exceto a trilha de criação do próprio cadastro."""
+    for relation in obj._meta.related_objects:
+        if relation.related_model is m.ActivityEvent:
+            continue
+        try:
+            related = getattr(obj, relation.get_accessor_name())
+        except ObjectDoesNotExist:
+            continue
+        if hasattr(related, "exists"):
+            if related.exists():
+                return True
+        elif related is not None:
+            return True
+    if isinstance(obj, m.Product) and obj.composition_id:
+        composition = obj.composition
+        if hasattr(composition, "quote") or hasattr(composition, "order"):
+            return True
+    return False
+
+
+@transaction.atomic
+def delete_or_inactivate(obj, reason, user=None):
+    """Apaga cadastro nunca usado; havendo histórico, executa inativação auditável."""
+    if not reason.strip():
+        raise ValidationError("Informe o motivo da exclusão.")
+    obj = type(obj).objects.select_for_update().get(pk=obj.pk)
+    if _has_operational_dependencies(obj) or (isinstance(obj, m.Product) and (obj.current_stock or obj.consignment_balances.filter(quantity__gt=0).exists())):
+        set_record_active(obj, False, user)
+        log_event(obj, "record.delete.soft", f"Exclusão lógica: {reason}", user)
+        return False
+    label = getattr(obj, "name", None) or getattr(obj, "code", None) or str(obj)
+    company, source_model, source_id = obj.company, obj._meta.label, obj.pk
+    composition_id = obj.composition_id if isinstance(obj, m.Product) else None
+    if isinstance(obj, m.Customer):
+        m.ActivityEvent.objects.filter(company=company, customer=obj).delete()
+    obj.delete()
+    if composition_id:
+        composition = m.Composition.objects.filter(pk=composition_id).first()
+        if composition and not (
+            m.Product.objects.filter(composition_id=composition_id).exists()
+            or m.Quote.objects.filter(composition_id=composition_id).exists()
+            or m.Order.objects.filter(composition_id=composition_id).exists()
+        ):
+            composition.delete()
+    m.ActivityEvent.objects.create(
+        company=company, kind="record.deleted", description=f"Cadastro {label} excluído definitivamente: {reason}",
+        user=user, source_model=source_model, source_id=source_id, event_key=f"deleted:{source_model}:{source_id}",
+        details={"label": label, "reason": reason, "mode": "physical"},
+    )
+    return True
 
 
 @transaction.atomic

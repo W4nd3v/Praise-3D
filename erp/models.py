@@ -92,6 +92,9 @@ class Company(TimeStampedModel):
     default_filament_minimum = models.PositiveIntegerField(default=2)
     material_cost_policy = models.CharField(max_length=12, choices=MATERIAL_COST_POLICIES, default="weighted")
     pricing_method = models.CharField(max_length=10, choices=PRICING_METHODS, default="margin")
+    receivable_days_after_completion = models.PositiveSmallIntegerField(default=0)
+    require_order_advance = models.BooleanField(default=False)
+    order_advance_percent = models.DecimalField(**PERCENT)
     active = models.BooleanField(default=True)
 
     def __str__(self):
@@ -432,7 +435,10 @@ class Composition(CompanyOwned):
             item_count += 1
             units += item.quantity
             for part in item.parts.filter(active=True):
-                multiplier = item.quantity * part.quantity
+                # Gramas e minutos descrevem uma mesa completa. O rateio é
+                # proporcional e deliberadamente não arredonda mesas parciais.
+                plate_quantity = Decimal(part.plate_quantity or 1)
+                multiplier = (item.quantity * part.quantity) / plate_quantity
                 part_grams = part.grams * multiplier
                 hours = (Decimal(part.print_minutes) / Decimal("60")) * multiplier
                 part_material = (part_grams / Decimal("1000")) * part.material_family.reference_cost_kg
@@ -453,8 +459,16 @@ class Composition(CompanyOwned):
                     "part_id": part.pk,
                     "part": part.name,
                     "family": part.material_family.name,
+                    "plate_quantity": part.plate_quantity,
+                    "plate_grams": str(part.grams),
+                    "plate_minutes": part.print_minutes,
+                    "part_quantity_per_item": str(part.quantity),
+                    "item_quantity": str(item.quantity),
+                    "rated_grams": str(part_grams),
+                    "rated_hours": str(hours),
+                    # Chaves antigas continuam no snapshot para leitores históricos.
                     "grams": str(part_grams),
-                    "minutes": part.print_minutes,
+                    "minutes": str(hours * Decimal("60")),
                     "reference_cost_kg": str(part.material_family.reference_cost_kg),
                     "snapshot_cost": str(money(sum((amount for key, amount in part_components.items() if rules[key]["cost"]), Decimal("0")))),
                     "direct_components": {key: str(money(amount)) for key, amount in part_components.items()},
@@ -567,6 +581,11 @@ class ManufacturingPart(CompanyOwned):
     print_minutes = models.PositiveIntegerField(default=0)
     printer = models.ForeignKey(Printer, null=True, blank=True, on_delete=models.PROTECT)
     quantity = models.DecimalField(**QTY)
+    plate_quantity = models.PositiveIntegerField("Qnt. na mesa", default=1)
+
+    def clean(self):
+        if self.plate_quantity < 1:
+            raise ValidationError("Qnt. na mesa deve ser um número inteiro maior ou igual a 1.")
 
 
 class CompositionSupply(CompanyOwned):
@@ -665,6 +684,9 @@ class Product(CompanyOwned):
     current_stock = models.DecimalField(**QTY)
     current_cost = models.DecimalField(**MONEY)
     current_price = models.DecimalField(**MONEY)
+    operational_activity = models.BooleanField("Em atividade", default=True)
+    deactivated_at = models.DateTimeField(null=True, blank=True)
+    deactivated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="deactivated_products")
 
     class Meta:
         ordering = ["name"]
@@ -679,6 +701,10 @@ class Product(CompanyOwned):
 
     @property
     def stock_status(self):
+        if not self.active:
+            return "inactive"
+        if not self.operational_activity:
+            return "paused"
         if self.current_stock < 0:
             return "critical"
         if self.current_stock <= self.minimum_stock:
@@ -765,6 +791,8 @@ class ProductionDemand(CompanyOwned):
     consumed_supplies = models.JSONField(default=dict, blank=True)
     ready_at = models.DateTimeField(null=True, blank=True)
     completed_stock_movement = models.BooleanField(default=False)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="cancelled_production_demands")
 
     class Meta:
         ordering = ["-priority", "deadline", "created_at"]
@@ -795,6 +823,7 @@ class StockMovement(CompanyOwned):
     source_type = models.CharField(max_length=60, blank=True)
     source_id = models.CharField(max_length=64, blank=True)
     note = models.CharField(max_length=240, blank=True)
+    location = models.CharField(max_length=180, blank=True, default="Estoque central")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
 
     class Meta:
@@ -802,9 +831,17 @@ class StockMovement(CompanyOwned):
 
 
 class FinancialAccount(CompanyOwned):
+    KINDS = [("cash", "Caixa"), ("checking", "Conta corrente"), ("digital", "Conta digital"), ("wallet", "Carteira"), ("other", "Outro")]
     name = models.CharField(max_length=120)
-    kind = models.CharField(max_length=16, choices=[("cash", "Caixa"), ("bank", "Banco"), ("digital", "Digital")], default="bank")
+    kind = models.CharField(max_length=16, choices=KINDS, default="checking")
+    institution = models.CharField(max_length=120, blank=True)
+    description = models.TextField(blank=True)
+    is_default = models.BooleanField(default=False)
     opening_balance = models.DecimalField(**MONEY)
+
+    class Meta:
+        ordering = ["-is_default", "name"]
+        constraints = [models.UniqueConstraint(fields=["company"], condition=models.Q(is_default=True), name="uniq_default_financial_account")]
 
     def __str__(self):
         return self.name
@@ -824,7 +861,7 @@ class FinancialEntry(CompanyOwned):
     direction = models.CharField(max_length=3, choices=DIRECTIONS)
     description = models.CharField(max_length=220)
     category = models.CharField(max_length=100)
-    account = models.ForeignKey(FinancialAccount, on_delete=models.PROTECT, related_name="entries")
+    account = models.ForeignKey(FinancialAccount, null=True, blank=True, on_delete=models.PROTECT, related_name="entries")
     customer = models.ForeignKey(Customer, null=True, blank=True, on_delete=models.PROTECT, related_name="financial_entries")
     supplier = models.CharField(max_length=140, blank=True)
     payment_method = models.ForeignKey(PaymentMethod, null=True, blank=True, on_delete=models.PROTECT)
@@ -889,6 +926,8 @@ class SaleItem(CompanyOwned):
 
 
 class Purchase(CompanyOwned):
+    STATUSES = [("draft", "Rascunho"), ("pending", "Pendente de efetivação"), ("effected", "Efetivada"), ("cancelled", "Cancelada")]
+    TYPES = [("filament", "Filamento"), ("supply", "Insumo")]
     code = models.CharField(max_length=16)
     supplier = models.CharField(max_length=160)
     purchase_date = models.DateField(default=timezone.localdate)
@@ -901,6 +940,8 @@ class Purchase(CompanyOwned):
     completed_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
     source_demand = models.ForeignKey(ProductionDemand, null=True, blank=True, on_delete=models.PROTECT, related_name="purchases")
+    status = models.CharField(max_length=12, choices=STATUSES, default="draft")
+    purchase_type = models.CharField(max_length=12, choices=TYPES, default="supply")
 
     class Meta:
         ordering = ["-purchase_date"]
@@ -941,6 +982,12 @@ class ConsignedStore(CompanyOwned):
     contact_name = models.CharField(max_length=140, blank=True)
     phone = models.CharField(max_length=24, blank=True)
     address = models.CharField(max_length=240, blank=True)
+    city = models.CharField(max_length=90, blank=True)
+    state = models.CharField(max_length=2, blank=True)
+    postal_code = models.CharField(max_length=12, blank=True)
+    district = models.CharField(max_length=100, blank=True)
+    street_number = models.CharField(max_length=20, blank=True)
+    complement = models.CharField(max_length=120, blank=True)
     default_commission_percent = models.DecimalField(**PERCENT)
     notes = models.TextField(blank=True)
 

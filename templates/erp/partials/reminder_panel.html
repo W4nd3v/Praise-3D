@@ -1,2 +1,18 @@
 {% load ui %}
-{% if due_reminders %}<section class="reminder-persistent" aria-label="Lembretes operacionais"><div class="reminder-title"><b>{% icon "bell" %} {{ due_reminders|length }} lembrete{{ due_reminders|length|pluralize }} pendente{{ due_reminders|length|pluralize }}</b></div>{% for reminder in due_reminders %}<article class="reminder-card {% if not forloop.first %}reminder-extra{% endif %}"><strong>Lembrete de solicitação · {{ reminder.request.code }}</strong><div>{{ reminder.request.customer.name }}</div><p>{{ reminder.request.description|truncatechars:100 }}</p><small>Original: {{ reminder.original_at|date:'d/m/Y H:i' }}<br>Agendado: {{ reminder.scheduled_at|date:'d/m/Y H:i' }} · Atrasado há {{ reminder.scheduled_at|timesince }}</small><div class="toolbar"><a class="button small primary" href="{% url 'request_detail' reminder.request_id %}">Abrir solicitação</a>{% if can_operate_reminders %}<button type="button" class="button small" data-snooze-id="{{ reminder.pk }}" data-version="{{ reminder.version }}">Adiar</button>{% endif %}</div></article>{% endfor %}{% if due_reminders|length > 1 %}<button class="button ghost small" type="button" data-expand-reminders>Expandir todos os lembretes</button>{% endif %}</section>{% endif %}
+{% if due_reminders %}
+<section class="reminder-persistent" aria-label="Lembretes operacionais">
+  <div class="reminder-title">
+    <b>{% icon "bell" %} {{ due_reminders|length }} lembrete{{ due_reminders|length|pluralize }} pendente{{ due_reminders|length|pluralize }}</b>
+    <span class="reminder-title-actions">{% if due_reminders|length > 1 %}<button class="button ghost small" type="button" data-expand-reminders aria-expanded="false">Ver todos</button>{% endif %}<button class="button ghost small" type="button" data-minimize-reminders aria-expanded="true">Recolher</button></span>
+  </div>
+  {% for reminder in due_reminders %}
+  <article class="reminder-card {% if not forloop.first %}reminder-extra{% endif %}">
+    <strong>Lembrete de solicitação · {{ reminder.request.code }}</strong>
+    <div>{{ reminder.request.customer.name }}</div>
+    <p>{{ reminder.request.description|truncatechars:100 }}</p>
+    <small>Original: {{ reminder.original_at|date:'d/m/Y H:i' }}<br>Agendado: {{ reminder.scheduled_at|date:'d/m/Y H:i' }} · Atrasado há {{ reminder.scheduled_at|timesince }}</small>
+    <div class="toolbar"><a class="button small primary" href="{% url 'request_detail' reminder.request_id %}">Abrir solicitação</a>{% if can_operate_reminders %}<button type="button" class="button small" data-snooze-id="{{ reminder.pk }}" data-version="{{ reminder.version }}">Adiar</button>{% endif %}</div>
+  </article>
+  {% endfor %}
+</section>
+{% endif %}

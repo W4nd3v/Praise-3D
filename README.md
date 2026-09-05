@@ -67,6 +67,19 @@ python manage.py test
 
 ## Atualização de correções — setembro/2026
 
+### Correção 4 — operação, pedidos, compras e filtros
+
+- Início com ações operacionais enriquecidas e área de Compras para mínimos e compras ainda não efetivadas.
+- Compras com vários itens do mesmo tipo, cálculo bidirecional entre unitário/total, estados Rascunho/Pendente/Efetivada/Cancelada e uma movimentação por item.
+- Contas a receber automáticas e idempotentes para entrada antecipada e saldo final do pedido, usando o prazo configurado em Parâmetros.
+- Contas financeiras configuráveis e conta obrigatória somente na liquidação; títulos pendentes não alteram saldo.
+- Reposição manual aceita qualquer inteiro positivo e pode ser retirada da fila somente antes de produzir efeitos, liberando reservas com auditoria.
+- Produtos possuem “Em atividade” independente de “Ativo”; a inativação zera estoque central e consignado por movimentos rastreáveis.
+- Cadastro completo de lojas consignadas, cálculo proporcional por “Qnt. na mesa”, conclusão da produção separada da entrega e tela consolidada de Pedidos.
+- Filtros avançados ficam recolhidos atrás do botão de funil e atualizam os resultados sem recarregar a página completa.
+- Exclusão segura: cadastros nunca usados podem ser removidos fisicamente; qualquer vínculo operacional força inativação e preservação do histórico.
+- Migração incremental `0007_correction4_operations`; testes automatizados ampliados para 73 casos.
+
 ### Correção 3 — operação, Cliente 360 e lembretes
 
 - Início: pendências clicáveis e próximas ações calculadas. Produção inclui arte, material, fila e impressão; prontos ficam separados.

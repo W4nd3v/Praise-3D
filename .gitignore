@@ -8,8 +8,5 @@ staticfiles/
 tmp/
 *.log
 .qa-correction3/
+.qa-correction4/
 backups/
-
-# Ignorar arquivos de migração
-**/migrations/*.py
-!**/migrations/__init__.py

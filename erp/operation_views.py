@@ -145,7 +145,7 @@ def reminder_snooze(request, pk):
 
 @tenant
 def orders_view(request, pk=None):
-    orders = op.visible_records(m.Order, request.company, request.GET.get("archived") == "1").filter(active=True).select_related("customer", "composition", "request", "quote").prefetch_related("demands__printer")
+    orders = op.visible_records(m.Order, request.company, request.GET.get("archived") == "1").filter(active=True).select_related("customer", "composition", "request", "quote").prefetch_related("demands__printer", "composition__items")
     for param, field in [("priority", "priority_level"), ("payment", "financial_status"), ("calculation", "calculation_status")]:
         if request.GET.get(param): orders = orders.filter(**{field: request.GET[param]})
     if request.GET.get("customer", "").isdigit(): orders = orders.filter(customer_id=request.GET["customer"])
@@ -157,11 +157,12 @@ def orders_view(request, pk=None):
     selected_id = str(pk or request.GET.get("selected", ""))
     selected = None
     if selected_id.isdigit():
-        selected = op.annotate_order(get_object_or_404(m.Order.objects.select_related("customer", "composition", "quote", "request").prefetch_related("demands__printer"), pk=selected_id, company=request.company))
+        selected = op.annotate_order(get_object_or_404(m.Order.objects.select_related("customer", "composition", "quote", "request").prefetch_related("demands__printer", "composition__items"), pk=selected_id, company=request.company))
     elif records: selected = records[0]
     events = m.ActivityEvent.objects.none()
     if selected:
         events = m.ActivityEvent.objects.filter(company=request.company).filter(Q(order=selected) | Q(request_id=selected.request_id) if selected.request_id else Q(order=selected))
+        selected.receivables = m.FinancialEntry.objects.filter(company=request.company, source_type="erp.Order", source_id=str(selected.pk), active=True).exclude(status="cancelled")
     context = common(request)
     context.update({"title": selected.code if pk and selected else "Pedidos", "orders_list": records, "selected": selected,
         "events": timeline(events), "idempotency_key": uuid.uuid4(), "priorities": m.Order.PRIORITIES,
@@ -174,6 +175,7 @@ def orders_view(request, pk=None):
 @tenant
 def order_update(request, pk):
     require_role(request)
+    order = get_object_or_404(m.Order, pk=pk, company=request.company)
     try:
         with transaction.atomic():
             order = get_object_or_404(m.Order.objects.select_for_update(), pk=pk, company=request.company)
@@ -188,9 +190,18 @@ def order_update(request, pk):
                 demand.deadline = order.deadline
                 demand.priority = order.priority
                 demand.save(update_fields=["deadline", "priority", "updated_at"])
+            from .activity import log_event
+            log_event(order, "order.schedule.updated", "Prioridade e prazo do pedido atualizados", request.user,
+                details={"priority": priority, "deadline": order.deadline.isoformat() if order.deadline else None})
             messages.success(request, "Prioridade e prazo atualizados.")
     except (ValidationError, ValueError) as exc:
-        messages.error(request, "; ".join(exc.messages) if hasattr(exc, "messages") else "Data inválida.")
+        error = "; ".join(exc.messages) if hasattr(exc, "messages") else "Data inválida."
+        messages.error(request, error)
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JsonResponse({"ok": False, "error": error}, status=400)
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        order.refresh_from_db()
+        return JsonResponse({"ok": True, "priority": order.get_priority_level_display(), "deadline": order.deadline.strftime("%d/%m/%Y") if order.deadline else "Sem prazo"})
     return redirect("order_detail", pk=pk)
 
 
@@ -298,7 +309,6 @@ def purchase_detail(request, pk):
         from .services import correct_purchase
         try:
             if request.POST.get("action") == "confirm":
-                if not purchase.account_id: raise ValidationError("Selecione a conta em Materiais antes de confirmar.")
                 complete_purchase(purchase, purchase.account, request.user)
             else:
                 line = get_object_or_404(m.PurchaseItem, pk=request.POST.get("item_id"), purchase=purchase, company=request.company)
@@ -324,7 +334,9 @@ def purchase_shortages(request, pk):
                 if not created:
                     return redirect("purchase_detail", pk=previous_result(operation).pk)
                 method = get_object_or_404(m.PaymentMethod, pk=request.POST.get("payment_method"), company=request.company, active=True)
-                account = get_object_or_404(m.FinancialAccount, pk=request.POST.get("account"), company=request.company, active=True)
+                account = m.FinancialAccount.objects.filter(
+                    pk=request.POST.get("account"), company=request.company, active=True
+                ).first() if request.POST.get("account") else None
                 supplier = request.POST.get("supplier", "").strip()
                 if not supplier: raise ValidationError("Informe o fornecedor.")
                 if not 1 <= int(request.POST.get("installments") or 1) <= 120: raise ValidationError("Parcelas devem estar entre 1 e 120.")
@@ -335,7 +347,8 @@ def purchase_shortages(request, pk):
                 purchase = m.Purchase.objects.create(company=request.company, code=m.Sequence.next(request.company, "COM"),
                     supplier=supplier, payment_method=method, account=account, source_demand=demand,
                     installments=max(1, int(request.POST.get("installments") or 1)),
-                    first_due_date=datetime.strptime(request.POST["first_due_date"], "%Y-%m-%d").date())
+                    first_due_date=datetime.strptime(request.POST["first_due_date"], "%Y-%m-%d").date(),
+                    status="pending", purchase_type="supply")
                 total = Decimal("0")
                 for ident, qty, cost in zip(ids, quantities, costs):
                     if not ident.isdigit() or int(ident) not in allowed: raise ValidationError("Insumo não pertence à demanda.")
@@ -382,24 +395,30 @@ def global_search(request):
 
 @tenant
 def record_manage(request, kind, pk):
-    catalog = {c.__name__: c for c in [m.Customer, m.Product, m.Supply, m.Filament, m.ConsignedStore, m.Printer, m.MaterialFamily, m.PaymentMethod, m.ProductCategory, m.ProductType]}
+    catalog = {c.__name__: c for c in [m.Customer, m.Product, m.Supply, m.Filament, m.ConsignedStore, m.Printer, m.MaterialFamily, m.PaymentMethod, m.FinancialAccount, m.ProductCategory, m.ProductType]}
     operations = {c.__name__: c for c in [m.Order, m.Quote, m.QuoteRequest, m.Sale, m.Purchase, m.ConsignmentShipment, m.FinancialEntry, m.ProductionDemand]}
     model = (catalog | operations).get(kind)
     if not model: raise PermissionDenied
     obj = get_object_or_404(model, pk=pk, company=request.company)
     if request.method == "POST":
-        from .lifecycle import cancel_record, set_record_active, archive_record
+        from .lifecycle import cancel_record, set_record_active, archive_record, delete_or_inactivate
         require_role(request, "finance" if kind in {"FinancialEntry", "Sale", "Purchase"} else "operation")
         try:
             with transaction.atomic():
                 action, reason = request.POST.get("action"), request.POST.get("reason", "").strip()
                 if not reason: raise ValidationError("Informe o motivo.")
+                deleted = False
                 if action == "cancel" and kind in operations: cancel_record(obj, reason, request.user)
+                elif action == "delete" and kind in catalog: deleted = delete_or_inactivate(obj, reason, request.user)
                 elif action in {"activate", "deactivate"} and kind in catalog: set_record_active(obj, action == "activate", request.user)
                 elif action in {"archive", "unarchive"}: archive_record(obj, action == "archive", request.user)
                 else: raise ValidationError("Ação inválida.")
-                log_event(obj, "record.reason", reason, request.user)
-            messages.success(request, "Operação registrada. Confira eventuais estornos pendentes no financeiro.")
+                if not deleted:
+                    log_event(obj, "record.reason", reason, request.user)
+            if deleted:
+                messages.success(request, "Cadastro sem movimentações excluído definitivamente; a auditoria da ação foi preservada.")
+                return redirect(f"/registros/?kind={kind}&status=all")
+            messages.success(request, "Operação registrada. O histórico e eventuais estornos foram preservados.")
         except ValidationError as exc: messages.error(request, "; ".join(exc.messages))
         return redirect("record_manage", kind=kind, pk=pk)
     return render(request, "erp/record_manage.html", {"title": "Gerenciar registro", "obj": obj, "kind": kind, "label": kind,
@@ -427,7 +446,7 @@ def quote_status(request, pk):
 
 @tenant
 def records_list(request):
-    choices = {c.__name__: c for c in [m.Customer, m.Product, m.Supply, m.Filament, m.ConsignedStore, m.Printer, m.PaymentMethod, m.MaterialFamily, m.ProductCategory, m.ProductType, m.Order, m.Quote, m.QuoteRequest, m.Sale, m.Purchase, m.ConsignmentShipment]}
+    choices = {c.__name__: c for c in [m.Customer, m.Product, m.Supply, m.Filament, m.ConsignedStore, m.Printer, m.PaymentMethod, m.FinancialAccount, m.MaterialFamily, m.ProductCategory, m.ProductType, m.Order, m.Quote, m.QuoteRequest, m.Sale, m.Purchase, m.ConsignmentShipment]}
     kind = request.GET.get("kind", "Customer")
     model = choices.get(kind, m.Customer)
     rows = op.visible_records(model, request.company, request.GET.get("archived") == "1")
